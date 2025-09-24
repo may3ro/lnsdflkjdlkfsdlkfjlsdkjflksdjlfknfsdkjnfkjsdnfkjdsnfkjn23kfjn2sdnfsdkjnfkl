@@ -1,1 +1,13 @@
-test
+@echo off
+echo path,filename,sha-256 > output.csv
+for /r %%F in (*) do (
+    for /f "tokens=*" %%A in ('echo %%F ^| findstr /v "%cd%"') do (
+        set relpath=%%A
+        set relpath=!relpath:\=/!
+        for %%B in ("!relpath!") do set fname=%%~nxB
+        certutil -hashfile "%%F" SHA256 > "%temp%\hash.tmp"
+        for /f "skip=1" %%C in ('type "%temp%\hash.tmp"') do set hash=%%C
+        del "%temp%\hash.tmp"
+        echo !relpath!,!fname!,!hash! >> output.csv
+    )
+)
