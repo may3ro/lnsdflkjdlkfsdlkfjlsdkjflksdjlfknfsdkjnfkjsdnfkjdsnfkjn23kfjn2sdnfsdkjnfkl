@@ -1,165 +1,294 @@
-<#
-.SYNOPSIS
-  Export SonarQube Security issues (VULNERABILITY) with file, line, and a code snippet.
+#!/usr/bin/env python3
+"""
+generate_file_manifest.py
 
-.PARAMETER BaseUrl
-  SonarQube base URL, e.g. https://sonar.mycompany.com
+Scan a directory tree and produce:
+ - manifest.csv  (flat table)
+ - manifest.json (detailed)
+ - appendix.md   (Markdown summary + table ready for report appendix)
 
-.PARAMETER Token
-  Personal token (My Account -> Security). Use as Bearer.
+Usage:
+  python generate_file_manifest.py --root /path/to/root --out-dir ./manifest_out --hash --exclude .git node_modules
 
-.PARAMETER ProjectKey
-  SonarQube project key (exact key, not display name).
+Warnings:
+ - Enabling --hash will compute SHA256 for every file (may be slow on many/large files).
+ - For very large repos consider running per-top-level-repo to parallelize externally.
+"""
+from __future__ import annotations
+import argparse
+import csv
+import hashlib
+import json
+import os
+import sys
+import fnmatch
+from pathlib import Path
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Iterable, List, Dict, Any, Optional
 
-.PARAMETER Branch
-  Optional branch name (omit or set "" if not using branches).
+TEXT_SAMPLE_BYTES = 4096
 
-.PARAMETER Languages
-  Optional comma-separated language filter, e.g. "abap,xml"
+def human_size(n: int) -> str:
+    for unit in ['B','KB','MB','GB','TB']:
+        if n < 1024:
+            return f"{n:.0f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}PB"
 
-.PARAMETER Context
-  Number of context lines around the issue line (default 2 → 5-line window).
+def is_text_file(path: Path) -> bool:
+    """
+    Heuristic: read a sample and check for NUL bytes or high non-text fraction.
+    """
+    try:
+        with path.open('rb') as f:
+            sample = f.read(TEXT_SAMPLE_BYTES)
+            if not sample:
+                return True
+            if b'\x00' in sample:
+                return False
+            # ratio of non-ASCII-like bytes
+            nonprint = sum(1 for b in sample if b < 9 or (b > 13 and b < 32) or b > 127)
+            return (nonprint / max(1, len(sample))) < 0.30
+    except Exception:
+        return False
 
-.PARAMETER OutCsv
-  Output CSV file path.
-#>
+def count_lines(path: Path, max_lines: Optional[int] = None) -> Optional[int]:
+    """
+    Count lines if file is text. Returns None for binary or unreadable files.
+    max_lines: if provided, stop after reading that many lines (faster)
+    """
+    try:
+        if not is_text_file(path):
+            return None
+        cnt = 0
+        with path.open('r', encoding='utf-8', errors='replace') as f:
+            for i, _ in enumerate(f, start=1):
+                cnt = i
+                if max_lines and cnt >= max_lines:
+                    break
+        return cnt
+    except Exception:
+        return None
 
-param(
-  [Parameter(Mandatory=$true)] [string]$BaseUrl,
-  [Parameter(Mandatory=$true)] [string]$Token,
-  [Parameter(Mandatory=$true)] [string]$ProjectKey,
-  [string]$Branch = "main",
-  [string]$Languages = "",
-  [int]$Context = 2,
-  [string]$OutCsv = "security_issues_with_snippets.csv"
-)
+def sha256_file(path: Path, block_size: int = 1<<20) -> Optional[str]:
+    try:
+        h = hashlib.sha256()
+        with path.open('rb') as f:
+            for block in iter(lambda: f.read(block_size), b''):
+                h.update(block)
+        return h.hexdigest()
+    except Exception:
+        return None
 
-$ErrorActionPreference = "Stop"
-$ProgressPreference = "SilentlyContinue"
+def match_any(name: str, patterns: Iterable[str]) -> bool:
+    for pat in patterns:
+        if fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(name, f"*{pat}*"):
+            return True
+    return False
 
-# Ensure TLS 1.2+ on older Windows PowerShell
-if ([System.Net.ServicePointManager]::SecurityProtocol -band [System.Net.SecurityProtocolType]::Tls12 -eq 0) {
-  [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-}
+def scan_tree(root: Path,
+              exclude_patterns: Iterable[str]=(),
+              compute_hash: bool=False,
+              max_lines_preview: Optional[int]=1000,
+              max_workers: int=4) -> Dict[str, Any]:
+    """
+    Walk root and gather metadata. Returns dict with summary, files list, per-repo map.
+    """
+    root = root.resolve()
+    files_out: List[Dict[str, Any]] = []
+    repos: Dict[str, Dict[str, Any]] = {}
+    total_bytes = 0
+    total_files = 0
+    total_dirs = 0
 
-# --- Auth header (Bearer). If your server needs Basic, see comment below. ---
-$Headers = @{ Authorization = "Bearer $Token" }
+    # For expensive operations (hash, line count) use a thread pool
+    tasks = []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for dirpath, dirnames, filenames in os.walk(root):
+            # prune excluded dirs in-place so os.walk doesn't descend into them
+            dirnames[:] = [d for d in dirnames if not match_any(d, exclude_patterns)]
+            total_dirs += 1
+            rel_dir = os.path.relpath(dirpath, root)
+            for fname in filenames:
+                if match_any(fname, exclude_patterns):
+                    continue
+                total_files += 1
+                abs_path = Path(dirpath) / fname
+                try:
+                    st = abs_path.stat()
+                    size = st.st_size
+                    mtime = datetime.fromtimestamp(st.st_mtime).isoformat(sep=' ', timespec='seconds')
+                except Exception:
+                    size = -1
+                    mtime = ""
+                total_bytes += max(0, size)
 
-function Invoke-SQGet {
-  param(
-    [Parameter(Mandatory=$true)] [string]$Path,
-    [hashtable]$Query = @{}
-  )
-  $uriBuilder = [System.UriBuilder]("$BaseUrl$Path")
-  # Append query parameters
-  if ($Query -and $Query.Count -gt 0) {
-    $nv = [System.Web.HttpUtility]::ParseQueryString([string]::Empty)
-    foreach ($k in $Query.Keys) { if ($null -ne $Query[$k] -and $Query[$k] -ne "") { $nv[$k] = [string]$Query[$k] } }
-    $uriBuilder.Query = $nv.ToString()
-  }
-  return Invoke-RestMethod -Method Get -Uri $uriBuilder.Uri -Headers $Headers
-}
+                # top-level repo folder heuristic: immediate child of root (if root/<repo>/...)
+                try:
+                    rel = abs_path.relative_to(root)
+                    parts = rel.parts
+                    repo_folder = parts[0] if len(parts) > 1 else "."
+                    rel_path_str = str(rel.as_posix())
+                except Exception:
+                    repo_folder = "."
+                    rel_path_str = str(abs_path)
 
-function Get-SQIssues {
-  [CmdletBinding()]
-  param()
-  $page = 1
-  $pageSize = 500
-  $baseParams = @{
-    componentKeys    = $ProjectKey
-    types            = "VULNERABILITY"
-    ps               = $pageSize
-    additionalFields = "_all"
-  }
-  if ($Branch)    { $baseParams.branch    = $Branch }
-  if ($Languages) { $baseParams.languages = $Languages }
+                record = {
+                    "relative_path": rel_path_str,
+                    "repo_folder": repo_folder,
+                    "filename": fname,
+                    "absolute_path": str(abs_path),
+                    "size_bytes": size,
+                    "size_human": human_size(size) if size >= 0 else "N/A",
+                    "modified": mtime,
+                    "is_text": None,
+                    "lines": None,
+                    "sha256": None,
+                    "error": None,
+                }
 
-  while ($true) {
-    $params = $baseParams.Clone()
-    $params.p = $page
-    $resp = Invoke-SQGet -Path "/api/issues/search" -Query $params
-    foreach ($it in ($resp.issues | ForEach-Object { $_ })) { $it }
-    $total = [int]$resp.paging.total
-    if ($page * $pageSize -ge $total) { break }
-    $page++
-  }
-}
+                files_out.append(record)
 
-# Cache file texts per component to avoid repeated calls
-$FileCache = @{}
+                # schedule expensive tasks
+                if compute_hash or max_lines_preview:
+                    tasks.append(pool.submit(_inspect_file, abs_path, compute_hash, max_lines_preview, record))
 
-function Get-FileLines {
-  param([Parameter(Mandatory=$true)][string]$ComponentKey)
-  if ($FileCache.ContainsKey($ComponentKey)) { return $FileCache[$ComponentKey] }
+    # wait for tasks to complete (they mutate record in place)
+    # Note: they should have been scheduled in the same process above, but ensure completion:
+    for t in as_completed(tasks):
+        try:
+            t.result()
+        except Exception:
+            # ignore individual file failures
+            pass
 
-  $q = @{ key = $ComponentKey }
-  if ($Branch) { $q.branch = $Branch }
-  try {
-    $raw = Invoke-SQGet -Path "/api/sources/raw" -Query $q
-    # Split on CRLF/LF into an array (1-based in our rendering)
-    $lines = ($raw -split "`r?`n")
-  } catch {
-    $lines = @()  # no access or binary (or file-level only)
-  }
-  $FileCache[$ComponentKey] = $lines
-  return $lines
-}
+    # build per-repo summary
+    per_repo = {}
+    for r in files_out:
+        repo = r["repo_folder"]
+        per_repo.setdefault(repo, {"files": 0, "size_bytes": 0, "text_files": 0})
+        per_repo[repo]["files"] += 1
+        per_repo[repo]["size_bytes"] += max(0, r["size_bytes"] or 0)
+        if r.get("is_text"):
+            per_repo[repo]["text_files"] += 1
 
-$results = New-Object System.Collections.Generic.List[object]
+    # sort files_out by repo then path
+    files_out.sort(key=lambda x: (x["repo_folder"], x["relative_path"]))
 
-Write-Host "Fetching security issues (type=VULNERABILITY) for '$ProjectKey'..." -ForegroundColor Cyan
-$issues = Get-SQIssues
-
-$idx = 0
-foreach ($i in $issues) {
-  $idx++
-  if ($idx % 50 -eq 0) { Write-Host ("Processed {0}/{1}..." -f $idx, ($issues.Count)) }
-
-  $component = $i.component
-  $line = $i.textRange.startLine
-  $snippet = ""
-  $lines = @()
-
-  if ($line -and $component) {
-    $lines = Get-FileLines -ComponentKey $component
-    if ($lines.Count -gt 0) {
-      $lo = [Math]::Max(1, $line - $Context)
-      $hi = [Math]::Min($lines.Count, $line + $Context)
-      $window = for ($ln = $lo; $ln -le $hi; $ln++) {
-        $mark = if ($ln -eq $line) { ">>" } else { "  " }
-        "{0} {1,5}: {2}" -f $mark, $ln, $lines[$ln-1]
-      }
-      $snippet = ($window -join "`n")
+    summary = {
+        "root": str(root),
+        "total_dirs": total_dirs,
+        "total_files": total_files,
+        "total_size_bytes": total_bytes,
+        "total_size_human": human_size(total_bytes),
+        "per_repo": {k: {"files": v["files"], "size_bytes": v["size_bytes"], "size_human": human_size(v["size_bytes"]), "text_files": v["text_files"]} for k, v in per_repo.items()},
     }
-  }
 
-  $obj = [pscustomobject]@{
-    IssueKey   = $i.key
-    Type       = $i.type
-    Severity   = $i.severity
-    Status     = $i.status
-    Rule       = $i.rule
-    Language   = $i.language
-    File       = $component
-    Line       = if ($line) { $line } else { "" }
-    Message    = ($i.message -replace "`r?`n"," ").Trim()
-    Snippet    = $snippet
-  }
-  $results.Add($obj) | Out-Null
-}
+    return {"summary": summary, "files": files_out}
 
-# If no issues, still create an empty CSV with headers
-if ($results.Count -eq 0) {
-  $results = ,([pscustomobject]@{
-    IssueKey=""; Type=""; Severity=""; Status=""; Rule=""
-    Language=""; File=""; Line=""; Message=""; Snippet=""
-  }) | Select-Object * | Select-Object -First 0
-}
+def _inspect_file(path: Path, compute_hash: bool, max_lines_preview: Optional[int], record: Dict[str, Any]):
+    """
+    Worker for each file: detect text, count lines (bounded), compute hash if requested.
+    Mutates record in place.
+    """
+    try:
+        record["is_text"] = is_text_file(path)
+        if record["is_text"] and max_lines_preview:
+            record["lines"] = count_lines(path, max_lines_preview)
+        else:
+            record["lines"] = None
+        if compute_hash:
+            record["sha256"] = sha256_file(path)
+    except Exception as e:
+        record["error"] = str(e)
 
-$results | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8
-Write-Host "Done. Wrote $($results.Count) rows to '$OutCsv'." -ForegroundColor Green
+def write_outputs(out_dir: Path, data: Dict[str, Any], max_preview: int = 200):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    files = data["files"]
 
-# --- OPTIONAL: Basic auth fallback (use instead of Bearer if needed) ---
-# $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$Token:"))
-# $Headers = @{ Authorization = "Basic $basic" }
+    # CSV
+    csv_path = out_dir / "manifest.csv"
+    fieldnames = ["relative_path","repo_folder","filename","absolute_path","size_bytes","size_human","modified","is_text","lines","sha256","error"]
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in files:
+            writer.writerow({k: r.get(k) for k in fieldnames})
 
+    # JSON
+    json_path = out_dir / "manifest.json"
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    # Markdown appendix
+    md_path = out_dir / "appendix.md"
+    with md_path.open("w", encoding="utf-8") as f:
+        s = data["summary"]
+        f.write(f"# File Manifest Appendix\n\n")
+        f.write(f"**Root scanned:** `{s['root']}`  \n")
+        f.write(f"**Scan date:** {datetime.now().isoformat(sep=' ', timespec='seconds')}  \n")
+        f.write(f"**Total directories:** {s['total_dirs']}  \n")
+        f.write(f"**Total files:** {s['total_files']}  \n")
+        f.write(f"**Total size:** {s['total_size_human']} ({s['total_size_bytes']} bytes)  \n\n")
+
+        f.write("## Per-repo summary\n\n")
+        f.write("| Repo folder | Files | Text files | Total size |\n")
+        f.write("|---:|---:|---:|---:|\n")
+        for repo, info in sorted(s["per_repo"].items(), key=lambda kv: kv[0]):
+            f.write(f"| `{repo}` | {info['files']} | {info['text_files']} | {info['size_human']} |\n")
+        f.write("\n")
+
+        f.write(f"## Top {max_preview} files (by size)\n\n")
+        f.write("| # | Repo | Relative path | Size | Lines | Text | SHA256 |\n")
+        f.write("|---:|---|---|---:|---:|---:|---|\n")
+        top_by_size = sorted(files, key=lambda r: (- (r.get('size_bytes') or 0), r['relative_path']))[:max_preview]
+        for i, r in enumerate(top_by_size, start=1):
+            sha = r.get("sha256") or ""
+            lines = r.get("lines") if r.get("lines") is not None else ""
+            txt = "yes" if r.get("is_text") else ""
+            f.write(f"| {i} | `{r['repo_folder']}` | `{r['relative_path']}` | {r['size_human']} | {lines} | {txt} | `{sha[:12]}` |\n")
+        f.write("\n")
+
+        f.write("## Full file listing (first 500 rows) — for full list see manifest.csv\n\n")
+        f.write("| # | Repo | Path | Size | Lines | Text |\n")
+        f.write("|---:|---|---|---:|---:|---:|\n")
+        for i, r in enumerate(files[:500], start=1):
+            f.write(f"| {i} | `{r['repo_folder']}` | `{r['relative_path']}` | {r['size_human']} | {r.get('lines','')} | {'yes' if r.get('is_text') else ''} |\n")
+
+    return {"csv": csv_path, "json": json_path, "md": md_path}
+
+def parse_args(argv: Optional[List[str]] = None):
+    p = argparse.ArgumentParser(description="Generate file manifest for report appendix")
+    p.add_argument("--root", required=True, help="Root directory to scan")
+    p.add_argument("--out-dir", default="./manifest_out", help="Output directory for manifest files")
+    p.add_argument("--exclude", nargs="*", default=[".git", "node_modules", "__pycache__", "venv"], help="Name patterns to exclude (glob)")
+    p.add_argument("--hash", action="store_true", help="Compute SHA256 for files (slow)")
+    p.add_argument("--max-lines", type=int, default=1000, help="Max lines to count per file (0=skip counting)")
+    p.add_argument("--max-workers", type=int, default=4, help="Number of threads for line/hash tasks")
+    p.add_argument("--max-preview", type=int, default=200, help="How many top files to show in markdown table")
+    return p.parse_args(argv)
+
+def main(argv: Optional[List[str]] = None):
+    args = parse_args(argv)
+    root = Path(args.root)
+    if not root.exists():
+        print("Root does not exist:", root, file=sys.stderr)
+        sys.exit(2)
+
+    print("Scanning:", root)
+    data = scan_tree(root,
+                     exclude_patterns=args.exclude,
+                     compute_hash=args.hash,
+                     max_lines_preview=(args.max_lines if args.max_lines > 0 else None),
+                     max_workers=args.max_workers)
+
+    out_dir = Path(args.out_dir)
+    assets = write_outputs(out_dir, data, max_preview=args.max_preview)
+    print("Wrote CSV:", assets["csv"])
+    print("Wrote JSON:", assets["json"])
+    print("Wrote Markdown appendix:", assets["md"])
+    print("Done.")
+
+if __name__ == "__main__":
+    main()
