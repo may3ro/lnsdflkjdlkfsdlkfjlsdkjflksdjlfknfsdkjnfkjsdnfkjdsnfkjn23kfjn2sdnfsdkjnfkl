@@ -1,136 +1,145 @@
+<#=====================================================================
+  Export-SonarQubeIssuesWithSnippets_v3.ps1
+  – Retrieves SonarQube issues + rule recommendation + code snippet
+  – Works on Windows, no extra modules required
+=====================================================================#>
+
 param(
-    [Parameter(Mandatory=$true)]
-    [string]$ServerUrl,
-    
-    [Parameter(Mandatory=$true)]
-    [string]$Token,
-    
-    [Parameter(Mandatory=$true)]
-    [string]$ProjectKey,
-    
-    [Parameter(Mandatory=$true)]
-    [string]$OutputPath,
-    
+    [Parameter(Mandatory=$true)][string]$ServerUrl,      # e.g. http://sonarqube:9000
+    [Parameter(Mandatory=$true)][string]$Token,          # API token (Browse permission)
+    [Parameter(Mandatory=$true)][string]$ProjectKey,     # exact project key
+    [Parameter(Mandatory=$true)][string]$OutputPath,     # CSV file to create
     [int]$SnippetLinesBefore = 3,
-    
-    [int]$SnippetLinesAfter = 3,
-    
-    [int]$PageSize = 100,  # Safer default
-    
-    [switch]$IncludeResolved  # New: Include fixed issues?
+    [int]$SnippetLinesAfter  = 3,
+    [int]$PageSize           = 100,
+    [switch]$IncludeResolved
 )
 
-Write-Host "Starting export for Project: $ProjectKey" -ForegroundColor Green
+# --------------------------------------------------------------------
+# Helper: write colored messages
+function Write-Info   { param([string]$msg) Write-Host $msg -ForegroundColor Cyan }
+function Write-Warn   { param([string]$msg) Write-Host $msg -ForegroundColor Yellow }
+function Write-Error  { param([string]$msg) Write-Host $msg -ForegroundColor Red }
 
-# Headers
+# --------------------------------------------------------------------
+# Headers for Basic-Auth (token only)
 $headers = @{
-    'Authorization' = "Basic $([Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Token")))"
-    'Accept' = 'application/json'
+    'Authorization' = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Token"))
+    'Accept'        = 'application/json'
 }
 
-# Test connection
+# --------------------------------------------------------------------
+# 1. Verify connection + token
 $testUri = "$ServerUrl/api/projects/search"
 try {
-    $testResp = Invoke-RestMethod -Uri $testUri -Headers $headers -Method Get
-    Write-Host "Connection OK. Found $($testResp.paging.total) projects." -ForegroundColor Green
+    $null = Invoke-RestMethod -Uri $testUri -Headers $headers -Method Get -ErrorAction Stop
+    Write-Info "Connection & token OK"
 } catch {
-    Write-Error "Connection/Auth failed: $($_.Exception.Message)"
+    Write-Error "Connection failed: $($_.Exception.Message)"
+    if ($_.Exception.Response.StatusCode -eq 401) { Write-Warn "Regenerate token in SonarQube UI" }
     exit 1
 }
 
-# Function: Rule details
+# --------------------------------------------------------------------
+# 2. Rule recommendation
 function Get-RuleDetails {
-    param($RuleKey)
+    param([string]$RuleKey)
     $uri = "$ServerUrl/api/rules/show?key=$RuleKey&actives_only=true"
     try {
-        $response = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
-        $rec = ($response.rule.htmlDesc -replace '<[^>]+>','' -replace "`r`n", "`n").Trim()  # Clean HTML + normalize lines
+        $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
+        $html = $resp.rule.htmlDesc -replace '<[^>]+>', '' -replace "`r`n","`n"
         return @{
-            Recommendation = if ($rec) { $rec } else { 'No recommendation available' }
-            Effort = if ($response.rule.remedialEffort) { $response.rule.remedialEffort } else { 'Unknown' }
+            Recommendation = ($html -split "`n" | ForEach-Object Trim | Where-Object {$_}) -join ' '
+            Effort        = $resp.rule.remedialEffort ?? 'Unknown'
         }
     } catch {
-        Write-Warning "Rule fetch failed for $RuleKey : $($_.Exception.Message)"
-        return @{ Recommendation = 'Error fetching recommendation'; Effort = 'Unknown' }
+        Write-Warn "Rule $RuleKey failed: $($_.Exception.Message)"
+        return @{ Recommendation = 'N/A'; Effort = 'Unknown' }
     }
 }
 
-# Function: Code snippet (UTF-8 aware)
+# --------------------------------------------------------------------
+# 3. Code snippet (UTF-8, line-aware)
 function Get-CodeSnippet {
-    param($ComponentKey, $LineNumber)
-    if (-not $LineNumber) { return 'File-level issue (no line specified)' }
+    param([string]$ComponentKey, [int]$LineNumber)
+    if (-not $LineNumber) { return 'File-level issue' }
+
     $uri = "$ServerUrl/api/sources/raw?key=$ComponentKey"
     try {
-        $sourceBytes = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -Raw
-        $source = [System.Text.Encoding]::UTF8.GetString($sourceBytes)
-        $lines = $source -split "`n" | Where-Object { $_ -ne '' }  # Trim empty
-        if ($lines.Count -eq 0) { return 'Empty source file' }
-        $startLine = [Math]::Max(1, $LineNumber - $SnippetLinesBefore)
-        $endLine = [Math]::Min($lines.Count, $LineNumber + $SnippetLinesAfter)
-        $snippetLines = @()
-        for ($i = $startLine - 1; $i -lt $endLine; $i++) {
-            $snippetLines += "Line $($i + 1): $($lines[$i])"
+        $raw = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ResponseHeadersVariable _ -ErrorAction Stop
+        $bytes = $raw.Content.ReadAsByteArrayAsync().Result
+        $source = [Text.Encoding]::UTF8.GetString($bytes)
+        $lines = $source -split "`n" | Where-Object { $_ -ne '' }
+
+        $start = [Math]::Max(1, $LineNumber - $SnippetLinesBefore)
+        $end   = [Math]::Min($lines.Count, $LineNumber + $SnippetLinesAfter)
+
+        $snippet = for ($i = $start-1; $i -lt $end; $i++) {
+            "Line $($i+1): $($lines[$i])"
         }
-        return $snippetLines -join "`n"
+        return $snippet -join "`n"
     } catch {
-        Write-Warning "Snippet fetch failed for $ComponentKey (Line $LineNumber): $($_.Exception.Message)"
-        return "Error: Unable to retrieve source (check if file exists/deleted)"
+        return "Snippet error: $($_.Exception.Message)"
     }
 }
 
-# Fetch issues with pagination
+# --------------------------------------------------------------------
+# 4. Pull all issues (pagination)
 $allIssues = @()
 $page = 1
-$resolvedParam = if ($IncludeResolved) { '' } else { '&resolved=false' }
-$uriBase = "$ServerUrl/api/issues/search?componentKeys=$ProjectKey&ps=$PageSize$resolvedParam"
+$resolved = if ($IncludeResolved) { '' } else { '&resolved=false' }
+$baseUri  = "$ServerUrl/api/issues/search?componentKeys=$ProjectKey&ps=$PageSize$resolved"
 
 do {
-    $uri = "$uriBase&p=$page"
-    Write-Host "Fetching page $page ..." -ForegroundColor Yellow
+    $uri = "$baseUri&p=$page"
+    Write-Info "Fetching page $page ..."
     try {
-        $response = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
-        $issues = $response.issues
+        $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
+        $issues = $resp.issues
         $allIssues += $issues
-        Write-Host "Page $page : $($issues.Count) issues (Total so far: $($allIssues.Count))" -ForegroundColor Cyan
-        if ($response.paging.total -eq 0) { Write-Warning "No issues found—check project key or add -IncludeResolved" }
+        Write-Info "   -> $($issues.Count) issues (total $($allIssues.Count))"
         $page++
     } catch {
-        Write-Error "Page fetch failed: $($_.Exception.Message)"
+        Write-Error "Page $page failed: $($_.Exception.Message)"
         break
     }
-} while ($allIssues.Count -lt $response.paging.total -and $issues.Count -gt 0)
+} while ($allIssues.Count -lt $resp.paging.total -and $issues.Count -gt 0)
 
 if ($allIssues.Count -eq 0) {
-    Write-Warning "No issues exported. Verify: ProjectKey='$ProjectKey', token perms, unresolved issues exist?"
+    Write-Warn "No issues found. Check ProjectKey, token scope, or add -IncludeResolved."
     exit 0
 }
 
-# Process
-Write-Host "Processing $($allIssues.Count) issues..." -ForegroundColor Green
-$exportData = @()
-$counter = 0
-foreach ($issue in $allIssues) {
-    $counter++
-    Write-Progress -Activity "Processing Issues" -Status "$counter/$($allIssues.Count)" -PercentComplete (($counter / $allIssues.Count) * 100)
-    
-    $ruleDetails = Get-RuleDetails -RuleKey $issue.rule
-    $snippet = Get-CodeSnippet -ComponentKey $issue.component -LineNumber $issue.line
-    
-    $exportData += [PSCustomObject]@{
-        'Rule ID' = $issue.rule
-        'Severity' = $issue.severity
-        'Type' = $issue.type
-        'Component' = $issue.component -replace "$ProjectKey`:", ''  # Clean path for ABAP files
-        'Line' = $issue.line
-        'Message' = $issue.message
-        'Recommendation' = $ruleDetails.Recommendation.Substring(0, [Math]::Min(500, $ruleDetails.Recommendation.Length)) + '...'  # Trunc for CSV
-        'Effort' = $ruleDetails.Effort
-        'Code Snippet' = $snippet.Substring(0, [Math]::Min(2000, $snippet.Length)) + '...'  # Trunc long snippets
+# --------------------------------------------------------------------
+# 5. Build export objects
+$export = @()
+$cnt = 0
+foreach ($i in $allIssues) {
+    $cnt++
+    Write-Progress -Activity "Processing" -Status "$cnt/$($allIssues.Count)" -PercentComplete ($cnt/$allIssues.Count*100)
+
+    $rule   = Get-RuleDetails -RuleKey $i.rule
+    $snip   = Get-CodeSnippet -ComponentKey $i.component -LineNumber $i.line
+
+    $export += [pscustomobject]@{
+        'Rule ID'       = $i.rule
+        'Severity'      = $i.severity
+        'Type'          = $i.type
+        'File'          = ($i.component -replace "^$ProjectKey`:", '')
+        'Line'          = $i.line
+        'Message'       = $i.message
+        'Recommendation'= ($rule.Recommendation.Substring(0,[Math]::Min(500,$rule.Recommendation.Length))) + '...'
+        'Effort'        = $rule.Effort
+        'Snippet'       = ($snip.Substring(0,[Math]::Min(2000,$snip.Length))) + '...'
     }
 }
+Write-Progress -Activity "Processing" -Completed
 
-# Export
-$exportData | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-Write-Host "Exported $($allIssues.Count) issues to $OutputPath" -ForegroundColor Green
-Write-Host "Sample row:" -ForegroundColor Gray
-$exportData | Select-Object -First 1 | Format-List
+# --------------------------------------------------------------------
+# 6. Export CSV
+$export | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+Write-Info "Exported $($export.Count) issues to $OutputPath"
+
+# Show first row as quick check
+Write-Info "Sample row:"
+$export | Select-Object -First 1 | Format-List
