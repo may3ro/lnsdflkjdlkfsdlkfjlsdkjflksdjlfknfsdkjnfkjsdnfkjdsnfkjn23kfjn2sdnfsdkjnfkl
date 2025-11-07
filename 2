@@ -61,11 +61,11 @@ do {
     } catch { Write-Error "Vulns API failed on page ${page}: $($_.Exception.Message)"; break }
 } while ($allVulns.Count -lt $resp.paging.total -and $resp.issues.Count -gt 0)
 
-# Fetch Hotspots – FIXED: Use hashtable @{}, not scriptblock {}
+# Fetch Hotspots – FIXED: Use @{} not {}
 $allHotspots = @()
 $page = 1
 do {
-    $params = @{ projectKey = $ProjectKey; ps = $PageSize; p = $page }
+    $params = @{ projectKey = $ProjectKey; ps = $PageSize; p = $page }  # <-- FIXED: @{}
     $uri = "$ServerUrl/api/hotspots/search?" + ($params.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '&'
     Write-Info "Fetching Hotspots page ${page}..."
     try {
