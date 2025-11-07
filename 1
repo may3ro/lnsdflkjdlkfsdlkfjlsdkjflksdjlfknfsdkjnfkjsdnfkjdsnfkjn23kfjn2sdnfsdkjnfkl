@@ -1,8 +1,21 @@
+# Get all web services
+$ws = irm "$Base/api/webservices/list" -Headers $H
+
+# Find the issues service (covers /api/issues and /api/v2/issues)
+$issuesSvc = $ws.webServices | Where-Object { $_.path -match '^api(\/v\d+)?/issues$' } | Select-Object -First 1
+if (-not $issuesSvc) { throw "Couldn't find an 'issues' service. Open $Base/web_api in a browser to confirm." }
+
+# Pull the 'search' action description
+$search = $issuesSvc.actions | Where-Object { $_.key -eq 'search' } | Select-Object -First 1
+$endpoint = "/$($issuesSvc.path)/$($search.key)"
+"$Base$endpoint"
+
+# List the *actual* parameter names your server accepts
+$search.params | Select-Object key, description
+
 $ProjectKey = 'abap-all-test3'   # put your real key here
 $u = "$Base$endpoint?projectKeys=$([uri]::EscapeDataString($ProjectKey))&p=1&ps=10"
 $resp = irm $u -Headers $H
 $resp.paging
 $resp.issues | Select-Object key, rule, severity, component, message -First 5
 
-
-irm "$Base/api/projects/search?projects=$([uri]::EscapeDataString($ProjectKey))" -Headers $H
