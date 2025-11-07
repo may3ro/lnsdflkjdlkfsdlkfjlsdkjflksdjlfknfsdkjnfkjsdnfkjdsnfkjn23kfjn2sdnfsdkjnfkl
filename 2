@@ -1,105 +1,145 @@
 # ====================================================================
-# SonarQube ABAP Code Security Export
-# Compatible with PowerShell 5.1
+# SonarQube ABAP Code Security Export (PS 5.1 compatible)
+# - Exports issues with rule info and code snippets
 # ====================================================================
 
 # ---- CONFIG ----
 $SonarQubeUrl = "https://your-sonarqube-server"
-$Token = "YOUR_TOKEN"
-$ProjectKey = "your_project_key"
-$OutputFile = "SonarQube_ABAP_Security_Report.csv"
+$Token        = "YOUR_TOKEN"
+$ProjectKey   = "your_project_key"
+$OutputFile   = "SonarQube_ABAP_Security_Report.csv"
+
+# ---- (optional) trust self-signed TLS for this session ----
+# [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 
 # ---- AUTH ----
-$pair = "$Token:"
+# IMPORTANT: use subexpression so the trailing ':' doesn't break parsing
+$pair         = "$($Token):"
 $encodedToken = [System.Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes($pair))
-$Headers = @{ Authorization = "Basic $encodedToken" }
+$Headers      = @{ Authorization = "Basic $encodedToken" }
 
-# ---- FUNCTIONS ----
+# ---- HELPERS ----
+function Invoke-GET {
+    param([string]$Url)
+    try {
+        return Invoke-RestMethod -Uri $Url -Headers $Headers -Method Get -ErrorAction Stop
+    } catch {
+        $msg = if ($_.Exception) { $_.Exception.Message } else { "$_" }
+        Write-Warning "HTTP GET failed: $Url -> $msg"
+        return $null
+    }
+}
 
 function Get-SonarQubeIssues {
     param([string]$ProjectKey)
-    $PageSize = 500
-    $Page = 1
+
+    $PageSize  = 500
+    $Page      = 1
     $AllIssues = @()
 
     do {
-        $Url = "$SonarQubeUrl/api/issues/search?componentKeys=$ProjectKey&p=$Page&ps=$PageSize"
-        try {
-            $Response = Invoke-RestMethod -Uri $Url -Headers $Headers -Method Get
-            $AllIssues += $Response.issues
-            $Total = [int]$Response.paging.total
-            $Page++
-        } catch {
-            Write-Warning "Error retrieving page $Page: $_"
-            break
-        }
-    } while ($AllIssues.Count -lt $Total)
+        $url = "$SonarQubeUrl/api/issues/search?componentKeys=$([uri]::EscapeDataString($ProjectKey))&p=$Page&ps=$PageSize"
+        $resp = Invoke-GET -Url $url
+        if (-not $resp) { break }
+
+        if ($resp.issues) { $AllIssues += $resp.issues }
+        $total = [int]$resp.paging.total
+        $Page++
+
+    } while ($AllIssues.Count -lt $total)
 
     return $AllIssues
 }
 
 function Get-RuleDetails {
     param([string]$RuleKey)
-    $RuleUrl = "$SonarQubeUrl/api/rules/show?key=$RuleKey"
-    try {
-        $RuleResponse = Invoke-RestMethod -Uri $RuleUrl -Headers $Headers -Method Get
-        return $RuleResponse.rule
-    } catch {
-        Write-Warning "Cannot retrieve rule $RuleKey"
-        return $null
-    }
+    $url  = "$SonarQubeUrl/api/rules/show?key=$([uri]::EscapeDataString($RuleKey))"
+    $resp = Invoke-GET -Url $url
+    if ($resp -and $resp.rule) { return $resp.rule }
+    Write-Warning "Cannot retrieve rule $RuleKey"
+    return $null
 }
 
 function Get-CodeSnippet {
-    param([string]$Component, [int]$Line)
-    $RawUrl = "$SonarQubeUrl/api/sources/raw?key=$Component"
-    try {
-        $RawText = Invoke-RestMethod -Uri $RawUrl -Headers $Headers -Method Get
-        $Lines = $RawText -split "`n"
-        $Start = [Math]::Max(0, $Line - 4)
-        $End = [Math]::Min($Lines.Length - 1, $Line + 2)
-        $Snippet = ""
-        for ($i = $Start; $i -le $End; $i++) {
-            $Snippet += ("{0,4}: {1}`n" -f ($i + 1), $Lines[$i])
-        }
-        return $Snippet.Trim()
-    } catch {
-        return ""
+    param([string]$ComponentKey, [int]$Line)
+
+    if (-not $Line -or $Line -le 0) { return "" }
+
+    $rawUrl  = "$SonarQubeUrl/api/sources/raw?key=$([uri]::EscapeDataString($ComponentKey))"
+    $rawText = Invoke-GET -Url $rawUrl
+    if (-not $rawText) { return "" }
+
+    $lines = $rawText -split "`n"
+    $start = [Math]::Max(1, $Line - 3)
+    $end   = [Math]::Min($lines.Length, $Line + 3)
+
+    $buf = New-Object System.Text.StringBuilder
+    for ($i = $start; $i -le $end; $i++) {
+        [void]$buf.AppendLine(("{0,4}: {1}" -f $i, $lines[$i-1]))
     }
+    $buf.ToString().TrimEnd()
+}
+
+function Strip-Html {
+    param([string]$s)
+    if (-not $s) { return "" }
+    # remove HTML tags and squeeze whitespace
+    (($s -replace '<[^>]+>', '') -replace '\s+', ' ').Trim()
 }
 
 # ---- MAIN ----
-Write-Host "Retrieving issues for project $ProjectKey ..."
-$Issues = Get-SonarQubeIssues -ProjectKey $ProjectKey
+Write-Host "Retrieving issues for project '$ProjectKey' ..."
+$issues = Get-SonarQubeIssues -ProjectKey $ProjectKey
 
-$ResultSet = @()
+$result = @()
 
-foreach ($Issue in $Issues) {
-    $RuleDetails = Get-RuleDetails -RuleKey $Issue.rule
-    $Snippet = if ($Issue.line) { Get-CodeSnippet -Component $Issue.component -Line $Issue.line } else { "" }
-
-    $Description = ""
-    $Recommendation = ""
-    if ($RuleDetails) {
-        $Description = ($RuleDetails.htmlDesc -replace '<[^>]+>', '') -replace '\s+', ' '
-        $Recommendation = ($RuleDetails.remediationFnBaseEffort -replace '<[^>]+>', '') -replace '\s+', ' '
+foreach ($issue in $issues) {
+    # line number can be in .line or .textRange.startLine depending on SQ version
+    $line = $null
+    if ($issue.PSObject.Properties.Name -contains 'line' -and $issue.line) {
+        $line = [int]$issue.line
+    } elseif ($issue.PSObject.Properties.Name -contains 'textRange' -and $issue.textRange -and $issue.textRange.startLine) {
+        $line = [int]$issue.textRange.startLine
     }
 
-    $ResultSet += New-Object PSObject -Property @{
+    $rule = Get-RuleDetails -RuleKey $issue.rule
+
+    # SonarQube rule fields vary by version; we normalize sensible fields
+    $ruleName = if ($rule -and $rule.name) { $rule.name } else { $issue.rule }
+    $desc     = if ($rule -and $rule.htmlDesc) { Strip-Html $rule.htmlDesc } else { "" }
+
+    # Best-effort recommendation text: some SQ versions have remediation metadata, others only in htmlDesc
+    $reco = ""
+    if ($rule) {
+        if ($rule.remediation) {
+            # Some editions expose remediation structure
+            $reco = Strip-Html ($rule.remediation.func + " " + $rule.remediation.gapDescription)
+        } elseif ($rule.debtRemFnBaseEffort) {
+            # Older field name
+            $reco = Strip-Html $rule.debtRemFnBaseEffort
+        } else {
+            # Fallback: try to extract a short “Fix/How to fix” phrase from description if present
+            $reco = $desc
+        }
+    }
+
+    $snippet = if ($line) { Get-CodeSnippet -ComponentKey $issue.component -Line $line } else { "" }
+
+    $result += [PSCustomObject]@{
         Project        = $ProjectKey
-        File           = $Issue.component
-        Line           = $Issue.line
-        Severity       = $Issue.severity
-        Type           = $Issue.type
-        RuleKey        = $Issue.rule
-        RuleName       = $RuleDetails.name
-        Message        = $Issue.message
-        Description    = $Description
-        Recommendation = $Recommendation
-        CodeSnippet    = $Snippet
+        File           = $issue.component
+        Line           = $line
+        Severity       = $issue.severity
+        Type           = $issue.type
+        RuleKey        = $issue.rule
+        RuleName       = $ruleName
+        Message        = $issue.message
+        Description    = $desc
+        Recommendation = $reco
+        CodeSnippet    = $snippet
     }
 }
 
 Write-Host "Exporting to CSV..."
-$ResultSet | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
+$result | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
 Write-Host "Export complete: $OutputFile"
