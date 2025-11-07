@@ -1,61 +1,95 @@
-# ===========================================
-# SonarQube ABAP Security Export (PS 7.5.4)
-# Project: abap-all-test3 | Vulnerabilities + Snippets
+# ============================================================
+# SonarQube ABAP Security Export (PS 7.5.4) - Full Script
+# Project: abap-all-test3
+# Output: Vulnerabilities with Rule text + ±3-line Snippets
 # Method: components/tree (files) -> issues/search (componentKeys)
-# ===========================================
+# ============================================================
 
-# -------- CONFIG --------
-$Base        = 'http://localhost:9000'           # SonarQube base
-$UserToken   = '<YOUR_USER_TOKEN>'               # user token with Browse + See Source Code
-$ProjectKey  = 'abap-all-test3'                  # real project key
-$Branch      = ''                                 # e.g. 'main' or '' if not used
-$PullRequest = ''                                 # e.g. '123' or '' if not PR
+# --------------- CONFIG ---------------
+$Base        = 'http://localhost:9000'     # SonarQube base URL (no trailing slash)
+$UserToken   = '<YOUR_USER_TOKEN>'         # User token with Browse + See Source Code
+$ProjectKey  = 'abap-all-test3'            # Real project key
+$Branch      = ''                           # e.g. 'main' or '' if not used
+$PullRequest = ''                           # e.g. '123' or '' if not a PR
 $OutCsv      = 'SQ_Vulnerabilities_abap-all-test3.csv'
-$BatchSize   = 100                                # componentKeys per call (safe chunk)
+$BatchSize   = 100                          # componentKeys per call (split automatically if URL too long)
+$SortMode    = 'SeverityThenFile'           # 'SeverityThenFile' or 'FileThenSeverity'
 
-# -------- AUTH HEADER (safe) --------
+# ------------- AUTH HEADER -------------
+# Avoid "$Var:" interpolation – build the Basic token safely
 $pair  = $UserToken + ':'
 $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
 $H     = @{ Authorization = "Basic $basic" }
 
-# -------- QUICK SANITY --------
-$ver = Invoke-RestMethod -Uri "$Base/api/server/version" -Headers $H -ErrorAction Stop
-Write-Host "SonarQube server: $ver"
-
-# -------- HELPERS --------
+# ------------- UTILS / HELPERS -------------
 function GET([string]$u) {
   Invoke-RestMethod -Uri $u -Headers $H -Method Get -ErrorAction Stop
 }
 
 function Strip-Html([string]$s) {
   if (-not $s) { return '' }
-  (($s -replace '<[^>]+>', '') -replace '\s+', ' ').Trim()
+  (($s -replace '<[^>]+>', ' ') -replace '\s+', ' ').Trim()
+}
+
+# Extract a subsection like "Why is this an issue?" or "How to fix it" from rule HTML/MD
+function Get-RuleSection {
+    param([string]$htmlOrMd, [string]$sectionTitle)
+    if (-not $htmlOrMd) { return '' }
+
+    # Try HTML heading blocks first
+    $pattern = "(?is)<h[12][^>]*>\s*$([regex]::Escape($sectionTitle))\s*</h[12]>\s*(?<body>.+?)(?:<h[12][^>]*>|\z)"
+    $m = [regex]::Match($htmlOrMd, $pattern)
+    if ($m.Success) {
+        $body = $m.Groups['body'].Value
+        return (Strip-Html $body)
+    }
+
+    # Fallback: Markdown ## section
+    $pattern2 = "(?im)^\s*##\s*$([regex]::Escape($sectionTitle))\s*$\R(?<body>[\s\S]+?)(?=^\s*##\s+|^\s*#\s+|\z)"
+    $m2 = [regex]::Match($htmlOrMd, $pattern2)
+    if ($m2.Success) { return (($m2.Groups['body'].Value -replace '\s+', ' ').Trim()) }
+
+    return ''
+}
+
+# Map Sonar severity to a sort rank
+function Severity-Rank {
+    param([string]$sev)
+    switch ($sev.ToUpperInvariant()) {
+        'BLOCKER'  { 0 }
+        'CRITICAL' { 1 }
+        'MAJOR'    { 2 }
+        'MINOR'    { 3 }
+        'INFO'     { 4 }
+        default    { 5 }
+    }
 }
 
 function Get-Rule([string]$RuleKey) {
   try {
-    $r = GET "$Base/api/rules/show?key=$([uri]::EscapeDataString($RuleKey))"
+    $r = GET ("$Base/api/rules/show?key={0}" -f [uri]::EscapeDataString($RuleKey))
     if ($r -and $r.rule) { $r.rule } else { $null }
   } catch { $null }
 }
 
 function Get-SourceLines([string]$ComponentKey) {
   # Try RAW first
-  $u = "$Base/api/sources/raw?key=$([uri]::EscapeDataString($ComponentKey))"
-  if ($Branch)      { $u += "&branch=$([uri]::EscapeDataString($Branch))" }
-  if ($PullRequest) { $u += "&pullRequest=$([uri]::EscapeDataString($PullRequest))" }
+  $u = "$Base/api/sources/raw?key={0}" -f [uri]::EscapeDataString($ComponentKey)
+  if ($Branch)      { $u += "&branch={0}"      -f [uri]::EscapeDataString($Branch) }
+  if ($PullRequest) { $u += "&pullRequest={0}" -f [uri]::EscapeDataString($PullRequest) }
   try {
     $raw = GET $u
     if ($raw) { return ($raw -split "`n") }
-  } catch { }
-  # Fallback: SHOW (JSON)
-  $u2 = "$Base/api/sources/show?key=$([uri]::EscapeDataString($ComponentKey))"
-  if ($Branch)      { $u2 += "&branch=$([uri]::EscapeDataString($Branch))" }
-  if ($PullRequest) { $u2 += "&pullRequest=$([uri]::EscapeDataString($PullRequest))" }
+  } catch {}
+
+  # Fallback to SHOW (JSON)
+  $u2 = "$Base/api/sources/show?key={0}" -f [uri]::EscapeDataString($ComponentKey)
+  if ($Branch)      { $u2 += "&branch={0}"      -f [uri]::EscapeDataString($Branch) }
+  if ($PullRequest) { $u2 += "&pullRequest={0}" -f [uri]::EscapeDataString($PullRequest) }
   try {
     $show = GET $u2
     if ($show -and $show.sources) { return @($show.sources | ForEach-Object { $_.code }) }
-  } catch { }
+  } catch {}
   $null
 }
 
@@ -68,59 +102,72 @@ function Snippet([string]$ComponentKey, [int]$Line) {
   ($start..$end | ForEach-Object { '{0,4}: {1}' -f $_, $lines[$_-1] }) -join "`n"
 }
 
-# -------- 1) Enumerate ALL file components under the project --------
-Write-Host "Collecting file components for project '$ProjectKey'..."
+# Encode each component key individually and join with commas (do NOT encode the commas)
+function Join-Encoded([string[]]$arr) {
+  if (-not $arr -or $arr.Count -eq 0) { return '' }
+  ($arr | ForEach-Object { [uri]::EscapeDataString($_) }) -join ','
+}
+
+# ------------- SANITY -------------
+$ver = GET "$Base/api/server/version"
+Write-Host "SonarQube server version: $ver"
+
+# Prove issues endpoint exists (no filter)
+$null = GET "$Base/api/issues/search?p=1&ps=1"
+
+# ------------- 1) Enumerate ALL file components in the project -------------
+Write-Host "Collecting file components for project '$ProjectKey' ..."
 $files = @()
 $p = 1; $ps = 500
 do {
-  $u = "$Base/api/components/tree?component=$([uri]::EscapeDataString($ProjectKey))&qualifiers=FIL&p=$p&ps=$ps"
-  if ($Branch)      { $u += "&branch=$([uri]::EscapeDataString($Branch))" }
-  if ($PullRequest) { $u += "&pullRequest=$([uri]::EscapeDataString($PullRequest))" }
+  $u = "$Base/api/components/tree?component={0}&qualifiers=FIL&p={1}&ps={2}" -f [uri]::EscapeDataString($ProjectKey), $p, $ps
+  if ($Branch)      { $u += "&branch={0}"      -f [uri]::EscapeDataString($Branch) }
+  if ($PullRequest) { $u += "&pullRequest={0}" -f [uri]::EscapeDataString($PullRequest) }
   $r = GET $u
   if ($r.components) { $files += $r.components }
   $p++
 } while ($r.components -and $r.components.Count -eq $ps)
 
-if ($files.Count -eq 0) {
-  throw "No file components found under project '$ProjectKey'. Verify the key and that analysis produced file components."
-}
+if ($files.Count -eq 0) { throw "No file components found under project '$ProjectKey'." }
 Write-Host ("Files discovered: {0}" -f $files.Count)
 
-# -------- 2) Pull vulnerabilities by file batches via componentKeys --------
-Write-Host "Fetching vulnerabilities (types=VULNERABILITY) across files..."
+# ------------- 2) Fetch vulnerabilities by file batches (componentKeys) -------------
+Write-Host "Fetching vulnerabilities across files (types=VULNERABILITY) ..."
 $issues = @()
+
 for ($i = 0; $i -lt $files.Count; $i += $BatchSize) {
   $slice = $files[$i..([Math]::Min($i + $BatchSize - 1, $files.Count - 1))]
-  $keys  = ($slice | ForEach-Object { $_.key }) -join ','
-  $u = "$Base/api/issues/search?componentKeys=$([uri]::EscapeDataString($keys))&types=VULNERABILITY&p=1&ps=500"
-  if ($Branch)      { $u += "&branch=$([uri]::EscapeDataString($Branch))" }
-  if ($PullRequest) { $u += "&pullRequest=$([uri]::EscapeDataString($PullRequest))" }
+  $keysArr = $slice | ForEach-Object { $_.key }
+  $keysEnc = Join-Encoded $keysArr
 
-  # Paginate inside the batch (if needed)
+  $baseUrl = "$Base/api/issues/search?componentKeys=$keysEnc&types=VULNERABILITY&ps=500"
+  if ($Branch)      { $baseUrl += "&branch={0}"      -f [uri]::EscapeDataString($Branch) }
+  if ($PullRequest) { $baseUrl += "&pullRequest={0}" -f [uri]::EscapeDataString($PullRequest) }
+
+  # Page through results for this batch
   $page = 1
   do {
-    $uPage = $u -replace 'p=1', ("p={0}" -f $page)
+    $uPage = $baseUrl + "&p=$page"
     try {
       $resp = GET $uPage
     } catch {
-      Write-Warning "Issues call failed for batch starting at index $i (URL too long or other error). Splitting to smaller batch..."
-      # Retry with smaller batch when URL too long (IIS/nginx limits). Split slice into halves.
+      # If URL too long, split the batch into halves and retry recursively
       if ($slice.Count -gt 1) {
+        Write-Warning "URL too long for batch starting at index $i. Splitting batch..."
         $half = [Math]::Floor($slice.Count / 2)
-        for ($j = 0; $j -lt $slice.Count; $j += $half) {
-          $sub = $slice[$j..([Math]::Min($j + $half - 1, $slice.Count - 1))]
-          $subkeys = ($sub | ForEach-Object { $_.key }) -join ','
-          $uSub = "$Base/api/issues/search?componentKeys=$([uri]::EscapeDataString($subkeys))&types=VULNERABILITY&p=1&ps=500"
-          if ($Branch)      { $uSub += "&branch=$([uri]::EscapeDataString($Branch))" }
-          if ($PullRequest) { $uSub += "&pullRequest=$([uri]::EscapeDataString($PullRequest))" }
-          $page2 = 1
+        foreach ($sub in @($slice[0..($half-1)], $slice[$half..($slice.Count-1)])) {
+          $subKeys = Join-Encoded (@($sub | ForEach-Object { $_.key }))
+          $subBase = "$Base/api/issues/search?componentKeys=$subKeys&types=VULNERABILITY&p=1&ps=500"
+          if ($Branch)      { $subBase += "&branch={0}"      -f [uri]::EscapeDataString($Branch) }
+          if ($PullRequest) { $subBase += "&pullRequest={0}" -f [uri]::EscapeDataString($PullRequest) }
+          $pg2 = 1
           do {
-            $r2 = GET ($uSub -replace 'p=1', ("p={0}" -f $page2))
+            $r2 = GET ($subBase -replace 'p=1', ("p={0}" -f $pg2))
             if ($r2.issues) { $issues += $r2.issues }
-            $tot2 = [int]$r2.paging.total
-            $pgCount2 = [math]::Ceiling($tot2 / 500)
-            $page2++
-          } while ($page2 -le $pgCount2)
+            $tot2   = [int]$r2.paging.total
+            $pages2 = [math]::Ceiling($tot2 / 500)
+            $pg2++
+          } while ($pg2 -le $pages2)
         }
       }
       break
@@ -128,29 +175,49 @@ for ($i = 0; $i -lt $files.Count; $i += $BatchSize) {
 
     if ($resp.issues) { $issues += $resp.issues }
     $total   = [int]$resp.paging.total
-    $pgCount = [math]::Ceiling($total / 500)
+    $pages   = [math]::Ceiling($total / 500)
     $page++
-  } while ($page -le $pgCount)
+  } while ($page -le $pages)
 }
+
 Write-Host ("Vulnerabilities collected: {0}" -f $issues.Count)
 
-# -------- 3) Enrich with rule text + code snippets --------
-Write-Host "Enriching with rule details and source snippets..."
+# ------------- 3) Enrich issues with rule text + Why/How + snippets -------------
+Write-Host "Enriching with rule details and code snippets ..."
 $rows = foreach ($i in $issues) {
-  $line = if ($i.line) { [int]$i.line } elseif ($i.textRange -and $i.textRange.startLine) { [int]$i.textRange.startLine } else { $null }
+  # normalize line
+  $line = $null
+  if ($i.line) { $line = [int]$i.line }
+  elseif ($i.textRange -and $i.textRange.startLine) { $line = [int]$i.textRange.startLine }
 
   $rule = Get-Rule $i.rule
   $ruleName = if ($rule -and $rule.name) { $rule.name } else { $i.rule }
-  $descHtml = if ($rule -and $rule.htmlDesc) { $rule.htmlDesc } elseif ($rule -and $rule.mdDesc) { $rule.mdDesc } else { '' }
-  $desc     = Strip-Html $descHtml
-  $reco     = if ($rule -and $rule.remediation) {
-                Strip-Html ( (($rule.remediation.func) ? $rule.remediation.func : '') + ' ' +
-                             (($rule.remediation.gapDescription) ? $rule.remediation.gapDescription : '') )
-              } elseif ($rule -and $rule.debtRemFnBaseEffort) {
-                Strip-Html $rule.debtRemFnBaseEffort
-              } else {
-                $desc
-              }
+
+  $descHtml = ''
+  if ($rule) {
+    if ($rule.htmlDesc) { $descHtml = $rule.htmlDesc }
+    elseif ($rule.mdDesc) { $descHtml = $rule.mdDesc }
+  }
+  $desc = Strip-Html $descHtml
+
+  # remediation text (fallback)
+  $reco = ''
+  if ($rule -and $rule.remediation) {
+    $rf = if ($rule.remediation.func) { $rule.remediation.func } else { '' }
+    $gd = if ($rule.remediation.gapDescription) { $rule.remediation.gapDescription } else { '' }
+    $reco = Strip-Html ($rf + ' ' + $gd)
+  } elseif ($rule -and $rule.debtRemFnBaseEffort) {
+    $reco = Strip-Html $rule.debtRemFnBaseEffort
+  } else {
+    $reco = $desc
+  }
+
+  # Sections: Why is this an issue? / How to fix it
+  $why  = Get-RuleSection -htmlOrMd $descHtml -sectionTitle 'Why is this an issue?'
+  $fix1 = Get-RuleSection -htmlOrMd $descHtml -sectionTitle 'How to fix it'
+  if (-not $fix1) { $fix1 = Get-RuleSection -htmlOrMd $descHtml -sectionTitle 'Recommended resolution' }
+  if (-not $why)  { $why  = $desc }
+  if (-not $fix1) { $fix1 = $reco }
 
   [pscustomobject]@{
     Project        = $ProjectKey
@@ -162,12 +229,21 @@ $rows = foreach ($i in $issues) {
     RuleKey        = $i.rule
     RuleName       = $ruleName
     Message        = $i.message
+    WhyIssue       = $why
     Description    = $desc
+    HowToFix       = $fix1
     Recommendation = $reco
     CodeSnippet    = (Snippet $i.component $line)
   }
 }
 
-# -------- 4) Export --------
+# ------------- 4) Sorting -------------
+if ($SortMode -eq 'SeverityThenFile') {
+  $rows = $rows | Sort-Object @{e={ Severity-Rank $_.Severity }}, @{e='File'}, @{e='Line'}
+} else {
+  $rows = $rows | Sort-Object @{e='File'}, @{e='Line'}, @{e={ Severity-Rank $_.Severity }}
+}
+
+# ------------- 5) Export -------------
 $rows | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8
 Write-Host "Export complete: $OutCsv"
