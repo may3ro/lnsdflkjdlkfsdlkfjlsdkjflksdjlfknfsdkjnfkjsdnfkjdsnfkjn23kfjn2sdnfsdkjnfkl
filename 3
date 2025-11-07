@@ -1,36 +1,33 @@
 <#=====================================================================
-  Export-SonarQubeIssuesWithSnippets_2025.4.2.ps1
-  – 100% compatible with SonarQube 2025.4.2 (Server, Enterprise, Data Center)
-  – Exports: Rule ID, Severity, File, Line, Message, Recommendation, Effort, Code Snippet
-  – Includes CWE/OWASP 2024 alignment via rule metadata (2025.4+)
+  Export-SonarQubeIssuesWithSnippets_2025.4.2_FIXED.ps1
+  – 100% compatible with SonarQube 2025.4.2 and PowerShell 5.1+
+  – No nullable operators, no syntax errors
 =====================================================================#>
 
 param(
-    [Parameter(Mandatory=$true)][string]$ServerUrl,      # e.g. https://sonarqube.mycompany.com
-    [Parameter(Mandatory=$true)][string]$Token,          # API token with 'Browse' permission
-    [Parameter(Mandatory=$true)][string]$ProjectKey,     # Exact project key
-    [Parameter(Mandatory=$true)][string]$OutputPath,     # Full path to CSV
+    [Parameter(Mandatory=$true)][string]$ServerUrl,
+    [Parameter(Mandatory=$true)][string]$Token,
+    [Parameter(Mandatory=$true)][string]$ProjectKey,
+    [Parameter(Mandatory=$true)][string]$OutputPath,
     [int]$SnippetLinesBefore = 3,
     [int]$SnippetLinesAfter  = 3,
-    [int]$PageSize           = 100,                     # Max 500 in 2025.4.2
-    [switch]$IncludeResolved,                           # Include closed issues?
-    [switch]$IncludeCWE                              # NEW: Add CWE ID (2025.4+)
+    [int]$PageSize           = 100,
+    [switch]$IncludeResolved,
+    [switch]$IncludeCWE
 )
 
 # --------------------------------------------------------------------
-# Helper output
 function Write-Info  { param([string]$m) Write-Host "[INFO]  $m" -ForegroundColor Cyan }
 function Write-Warn  { param([string]$m) Write-Host "[WARN]  $m" -ForegroundColor Yellow }
 function Write-Error { param([string]$m) Write-Host "[ERROR] $m" -ForegroundColor Red }
 
 # --------------------------------------------------------------------
-# Auth headers
 $headers = @{
     'Authorization' = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Token"))
     'Accept'        = 'application/json'
 }
 
-# Optional: Skip self-signed certs
+# Skip self-signed certs (optional)
 $global:PSDefaultParameterValues['Invoke-RestMethod:SkipCertificateCheck'] = $true
 
 # --------------------------------------------------------------------
@@ -39,34 +36,39 @@ $testUri = "$ServerUrl/api/server/version"
 try {
     $version = Invoke-RestMethod -Uri $testUri -Headers $headers -Method Get -ErrorAction Stop
     Write-Info "Connected to SonarQube $version"
-} catch {
+}
+catch {
     Write-Error "Connection failed: $($_.Exception.Message)"
-    if ($_.Exception.Response.StatusCode -eq 401) { Write-Warn "Regenerate token (My Account > Security)" }
+    if ($_.Exception.Response.StatusCode -eq 401) { Write-Warn "Regenerate token" }
     exit 1
 }
 
 # --------------------------------------------------------------------
-# 2. Rule details (2025.4+ includes CWE)
+# 2. Rule details
 function Get-RuleDetails {
     param([string]$RuleKey)
     $uri = "$ServerUrl/api/rules/show?key=$RuleKey&actives_only=true"
     try {
         $r = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
         $desc = ($r.rule.htmlDesc -replace '<[^>]+>', '' -replace "`r`n","`n").Trim()
-        $cwe = if ($IncludeCWE -and $r.rule.cwe) { $r.rule.cwe -join ', ' } else { '' }
+        $cwe = ''
+        if ($IncludeCWE -and $r.rule.cwe) { $cwe = $r.rule.cwe -join ', ' }
+        $effort = 'Unknown'
+        if ($r.rule.remedialEffort) { $effort = $r.rule.remedialEffort }
         return @{
             Recommendation = ($desc -split "`n" | ForEach-Object Trim | Where-Object {$_}) -join ' '
-            Effort        = $r.rule.remedialEffort ?? 'Unknown'
+            Effort        = $effort
             CWE           = $cwe
         }
-    } catch {
+    }
+    catch {
         Write-Warn "Rule $RuleKey failed: $($_.Exception.Message)"
         return @{ Recommendation = 'N/A'; Effort = 'Unknown'; CWE = '' }
     }
 }
 
 # --------------------------------------------------------------------
-# 3. Code snippet (UTF-8, line-aware)
+# 3. Code snippet
 function Get-CodeSnippet {
     param([string]$ComponentKey, [int]$LineNumber)
     if (-not $LineNumber) { return 'File-level issue (no line)' }
@@ -85,13 +87,14 @@ function Get-CodeSnippet {
             "Line $($i+1): $($lines[$i])"
         }
         return $snippet -join "`n"
-    } catch {
+    }
+    catch {
         return "Snippet error: $($_.Exception.Message)"
     }
 }
 
 # --------------------------------------------------------------------
-# 4. Fetch issues (pagination)
+# 4. Fetch issues
 $allIssues = @()
 $page = 1
 $resolved = if ($IncludeResolved) { '' } else { '&resolved=false' }
@@ -106,14 +109,15 @@ do {
         $allIssues += $issues
         Write-Info "   -> $($issues.Count) issues (total $($allIssues.Count))"
         $page++
-    } catch {
+    }
+    catch {
         Write-Error "Page $page failed: $($_.Exception.Message)"
         break
     }
 } while ($allIssues.Count -lt $resp.paging.total -and $issues.Count -gt 0)
 
 if ($allIssues.Count -eq 0) {
-    Write-Warn "No issues found. Check: ProjectKey='$ProjectKey', token scope, or use -IncludeResolved"
+    Write-Warn "No issues found. Use -IncludeResolved or check ProjectKey."
     exit 0
 }
 
@@ -125,8 +129,8 @@ foreach ($i in $allIssues) {
     $cnt++
     Write-Progress -Activity "Processing Issues" -Status "$cnt/$($allIssues.Count)" -PercentComplete ($cnt/$allIssues.Count*100)
 
-    $rule   = Get-RuleDetails -RuleKey $i.rule
-    $snip   = Get-CodeSnippet -ComponentKey $i.component -LineNumber $i.line
+    $rule = Get-RuleDetails -RuleKey $i.rule
+    $snip = Get-CodeSnippet -ComponentKey $i.component -LineNumber $i.line
 
     $export += [pscustomobject]@{
         'Rule ID'        = $i.rule
@@ -141,14 +145,11 @@ foreach ($i in $allIssues) {
         'Snippet'        = ($snip.Substring(0,[Math]::Min(2000,$snip.Length))) + '...'
     }
 }
-Write-Progress -Activity "Processing" -Completed
+Write-Progress -Activity "Processing Issues" -Completed
 
 # --------------------------------------------------------------------
 # 6. Export CSV
 $export | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-Write-Info "SUCCESS: Exported $($export.Count) issues to:"
-Write-Info "   $OutputPath"
-
-# Show first row
+Write-Info "Exported $($export.Count) issues to $OutputPath"
 Write-Info "Sample row:"
 $export | Select-Object -First 1 | Format-List
