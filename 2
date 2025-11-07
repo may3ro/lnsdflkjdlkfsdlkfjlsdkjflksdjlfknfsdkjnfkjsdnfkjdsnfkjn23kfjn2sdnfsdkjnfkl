@@ -16,7 +16,7 @@ function Write-Error { param([string]$m) Write-Host "[ERROR] $m" -ForegroundColo
 $headers = @{ Authorization = "Basic $([Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Token")))"; Accept = 'application/json' }
 $ProgressPreference = 'SilentlyContinue'
 
-# Verify
+# Verify Connection
 $testUri = "$ServerUrl/api/system/status"
 try { $status = Invoke-RestMethod -Uri $testUri -Headers $headers -SkipCertificateCheck -ErrorAction Stop; Write-Info "Connected to $($status.version)" }
 catch { Write-Error "Connection failed: $($_.Exception.Message)"; return }
@@ -46,7 +46,7 @@ function Get-CodeSnippet { param([string]$ComponentKey, [int]$LineNumber)
     } catch { Write-Warn "Snippet failed: $ComponentKey (Line $LineNumber)"; return 'Source unavailable (check "See Source Code" perm)' }
 }
 
-# Fetch Vulnerabilities (type=VULNERABILITY)
+# Fetch Vulnerabilities
 $allVulns = @()
 $page = 1
 do {
@@ -61,11 +61,11 @@ do {
     } catch { Write-Error "Vulns API failed on page ${page}: $($_.Exception.Message)"; break }
 } while ($allVulns.Count -lt $resp.paging.total -and $resp.issues.Count -gt 0)
 
-# Fetch Hotspots (/api/hotspots/search)
+# Fetch Hotspots – FIXED: Use hashtable @{}, not scriptblock {}
 $allHotspots = @()
 $page = 1
 do {
-    $params = { projectKey = $ProjectKey; ps = $PageSize; p = $page }
+    $params = @{ projectKey = $ProjectKey; ps = $PageSize; p = $page }
     $uri = "$ServerUrl/api/hotspots/search?" + ($params.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '&'
     Write-Info "Fetching Hotspots page ${page}..."
     try {
@@ -76,7 +76,7 @@ do {
     } catch { Write-Error "Hotspots API failed on page ${page}: $($_.Exception.Message)"; break }
 } while ($allHotspots.Count -lt $resp.paging.total -and $resp.hotspots.Count -gt 0)
 
-# Combine and Normalize
+# Combine
 $allSecurity = $allVulns + $allHotspots | ForEach-Object {
     $item = $_
     [PSCustomObject]@{
