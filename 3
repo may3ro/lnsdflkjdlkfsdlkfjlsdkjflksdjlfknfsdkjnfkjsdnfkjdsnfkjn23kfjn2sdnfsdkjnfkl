@@ -1,16 +1,16 @@
 <#=====================================================================
-  Export-ABAPSonarSnippets_PS7.ps1
-  – Optimized for PowerShell 7.5.4
-  – Extracts ABAP code snippets + recommendations from SonarQube 2025.4.2
-  – Requires: Private project + "See Source Code" permission
+  Export-ABAPSonarSnippets_PS7_FIXED.ps1
+  – Fully compatible with PowerShell 7.5.4
+  – No parsing errors (uses ${page}, safe string formatting)
+  – Extracts ABAP snippets + recommendations from SonarQube 2025.4.2
 =====================================================================#>
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][string]$ServerUrl,      # e.g. https://sonarqube.corp.com
-    [Parameter(Mandatory)][string]$Token,          # API token
-    [Parameter(Mandatory)][string]$ProjectKey,     # e.g. abap-tfs-audit
-    [Parameter(Mandatory)][string]$OutputPath,     # Full CSV path
+    [Parameter(Mandatory)][string]$ServerUrl,
+    [Parameter(Mandatory)][string]$Token,
+    [Parameter(Mandatory)][string]$ProjectKey,
+    [Parameter(Mandatory)][string]$OutputPath,
     [int]$SnippetLinesBefore = 5,
     [int]$SnippetLinesAfter = 5,
     [int]$PageSize = 100,
@@ -19,7 +19,6 @@ param(
 )
 
 # --------------------------------------------------------------------
-# Modern PS7+ helpers
 function Write-Info   { param([string]$m) Write-Host "[INFO]  $m" -ForegroundColor Cyan }
 function Write-Warn   { param([string]$m) Write-Host "[WARN]  $m" -ForegroundColor Yellow }
 function Write-Error  { param([string]$m) Write-Host "[ERROR] $m" -ForegroundColor Red }
@@ -30,9 +29,6 @@ $headers = @{
     Accept        = 'application/json'
 }
 
-# Skip cert check (PS7+ native)
-$ProgressPreference = 'SilentlyContinue'
-
 # --------------------------------------------------------------------
 # 1. Verify connection
 $testUri = "$ServerUrl/api/system/status"
@@ -41,12 +37,12 @@ try {
     Write-Info "Connected to SonarQube $($status.version) - Status: $($status.status)"
 } catch {
     Write-Error "Connection failed: $($_.Exception.Message)"
-    if ($_.Exception.Response.StatusCode -eq 401) { Write-Warn "Token invalid or missing 'See Source Code' permission" }
+    if ($_.Exception.Response.StatusCode -eq 401) { Write-Warn "Invalid token or missing 'See Source Code' permission" }
     return
 }
 
 # --------------------------------------------------------------------
-# 2. Rule details with CWE
+# 2. Rule details
 function Get-RuleDetails {
     param([string]$RuleKey)
     $uri = "$ServerUrl/api/rules/show?key=$RuleKey&actives_only=true"
@@ -65,12 +61,12 @@ function Get-RuleDetails {
 }
 
 # --------------------------------------------------------------------
-# 3. Code snippet (async stream for large files)
+# 3. Code snippet
 function Get-CodeSnippet {
     param([string]$ComponentKey, [int]$LineNumber)
 
     if (-not $LineNumber) {
-        Write-Warn "No line number → File-level issue: $ComponentKey"
+        Write-Warn "File-level issue: $ComponentKey"
         return 'File-level issue (no line number)'
     }
 
@@ -94,12 +90,12 @@ function Get-CodeSnippet {
         return $snippet -join "`n"
     } catch {
         Write-Warn "Snippet failed for $ComponentKey (Line $LineNumber): $($_.Exception.Message)"
-        return 'Source access denied or file not found'
+        return 'Source access denied'
     }
 }
 
 # --------------------------------------------------------------------
-# 4. Fetch issues (Vulnerabilities + Bugs only)
+# 4. Fetch issues
 $allIssues = @()
 $page = 1
 do {
@@ -113,7 +109,7 @@ do {
 
     $uri = "$ServerUrl/api/issues/search?" + ($params.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '&'
 
-    Write-Info "Fetching page $page..."
+    Write-Info "Fetching page ${page}..."
     try {
         $resp = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
         $issues = $resp.issues
@@ -121,13 +117,14 @@ do {
         Write-Info "   → $($issues.Count) issues (total: $($allIssues.Count))"
         $page++
     } catch {
-        Write-Error "API failed on page $page: $($_.Exception.Message)"
+        # FIXED: Use ${page} to avoid parser error
+        Write-Error "API failed on page ${page}: $($_.Exception.Message)"
         break
     }
 } while ($allIssues.Count -lt $resp.paging.total -and $issues.Count -gt 0)
 
 if ($allIssues.Count -eq 0) {
-    Write-Warn "No vulnerabilities or bugs found. Try removing type filter or re-scanning."
+    Write-Warn "No vulnerabilities or bugs found. Re-scan project or remove type filter."
     return
 }
 
@@ -155,8 +152,8 @@ $export = foreach ($i in $allIssues) {
 # --------------------------------------------------------------------
 # 6. Export CSV
 $export | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-Write-Info "SUCCESS: Exported $($export.Count) ABAP issues → $OutputPath"
+Write-Info "SUCCESS: Exported $($export.Count) ABAP issues to $OutputPath"
 
 # Show sample
-Write-Info "Sample High/Critical Issue:"
-$export | Where-Object Severity -in 'CRITICAL','HIGH' | Select-Object -First 1 | Format-List
+Write-Info "Sample Critical Issue:"
+$export | Where-Object Severity -eq 'CRITICAL' | Select-Object -First 1 | Format-List
