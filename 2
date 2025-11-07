@@ -1,96 +1,98 @@
-# ================================
-# SonarQube ABAP Security Export
-# Works with SonarQube 2025.x
-# PowerShell 5.1 compatible
-# ================================
+# ===============================================
+# SonarQube ABAP Security Export (PS 7.5.4 / SQ 2025.x)
+# - Issues + rule text + code snippets (±3 lines)
+# - Branch / PR aware
+# - Parallel fetch for rules & sources
+# ===============================================
 
-# -------- CONFIG --------
+# ------------ CONFIG ------------
 $SonarQubeUrl = "http://localhost:9000"
 $UserToken    = "YOUR_USER_TOKEN_WITH_SOURCE_ACCESS"
 $ProjectKey   = "your_project_key"
 $Branch       = ""          # e.g. "develop" or "" for main
-$PullRequest  = ""          # e.g. "123" if exporting a PR; leave "" if not a PR
+$PullRequest  = ""          # e.g. "123" or "" if not PR
 $OutputCsv    = "SonarQube_ABAP_Security_Report.csv"
+$Throttle     = 8           # parallelism for rule/source fetch (tune to your server)
+$UseShowOnly  = $false      # set $true if /api/sources/raw is blocked by policy
 
-# Optional: trust self-signed TLS
-# [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+# Optional: skip TLS checks (self-signed lab)
+$Global:SkipTLS = $false    # set true if you have a self-signed cert
 
-# -------- AUTH --------
-$pair         = ($UserToken + ":")
+# ------------ AUTH & HTTP ------------
+$pair         = "$UserToken:"
 $encodedToken = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
-$Headers      = @{ "Authorization" = ("Basic {0}" -f $encodedToken) }
+$Headers      = @{ Authorization = "Basic $encodedToken" }
 
-# -------- HELPERS --------
-function Add-QS {
-    param([string]$url, [hashtable]$kv)
-    if (-not $kv) { return $url }
-    $parts = @()
-    foreach ($k in $kv.Keys) {
-        if ($kv[$k] -ne $null -and $kv[$k] -ne "") {
-            $parts += ("{0}={1}" -f [uri]::EscapeDataString($k), [uri]::EscapeDataString([string]$kv[$k]))
+function Add-QS([string]$url, [hashtable]$kv) {
+    $pairs = foreach ($k in $kv.Keys) {
+        if ($null -ne $kv[$k] -and $kv[$k] -ne "") {
+            "{0}={1}" -f [uri]::EscapeDataString($k), [uri]::EscapeDataString([string]$kv[$k])
         }
     }
-    if ($parts.Count -eq 0) { return $url }
-    if ($url -like "*?*") { return ($url + "&" + ($parts -join "&")) }
-    else { return ($url + "?" + ($parts -join "&")) }
+    if (-not $pairs -or $pairs.Count -eq 0) { return $url }
+    if ($url -like "*?*") { "$url&$($pairs -join '&')" } else { "$url?$($pairs -join '&')" }
 }
 
-function GET {
-    param([string]$url, [switch]$Quiet)
+function GET([string]$url, [switch]$Quiet) {
     try {
-        return Invoke-RestMethod -Uri $url -Headers $Headers -Method Get -ErrorAction Stop
+        if ($Global:SkipTLS) { return Invoke-RestMethod -Uri $url -Headers $Headers -Method Get -SkipCertificateCheck -ErrorAction Stop }
+        else                 { return Invoke-RestMethod -Uri $url -Headers $Headers -Method Get -ErrorAction Stop }
     } catch {
         if (-not $Quiet) {
-            $msg = if ($_.Exception) { $_.Exception.Message } else { ("" + $_) }
-            Write-Warning ("HTTP GET failed: {0} -> {1}" -f $url, $msg)
+            $msg = $_.Exception.Message
+            Write-Warning "HTTP GET failed: $url -> $msg"
         }
-        return $null
+        $null
     }
 }
 
+# ------------ CORE CALLS ------------
 function Get-ServerVersion {
-    $u = ("{0}/api/server/version" -f $SonarQubeUrl)
-    $r = GET $u -Quiet
-    if ($r) { return [string]$r }
-    return "unknown"
+    GET "$SonarQubeUrl/api/server/version" -Quiet
 }
 
-function Get-Issues {
-    param([string]$ProjectKey)
-    $all = @()
+function Get-Issues([string]$ProjectKey) {
+    $all  = @()
     $page = 1
-    $ps = 500
-
+    $ps   = 500
     do {
-        $base = ("{0}/api/issues/search" -f $SonarQubeUrl)
-        $qs = @{
-            componentKeys = $ProjectKey
-            p            = $page
-            ps           = $ps
-        }
-        if ($Branch -ne "")     { $qs["branch"] = $Branch }
-        if ($PullRequest -ne ""){ $qs["pullRequest"] = $PullRequest }
-
-        $url = Add-QS -url $base -kv $qs
-        $resp = GET $url
+        $base = "$SonarQubeUrl/api/issues/search"
+        $qs = @{ componentKeys = $ProjectKey; p = $page; ps = $ps }
+        if ($Branch)      { $qs.branch = $Branch }
+        if ($PullRequest) { $qs.pullRequest = $PullRequest }
+        $resp = GET (Add-QS $base $qs)
         if (-not $resp) { break }
-
         if ($resp.issues) { $all += $resp.issues }
         $total = [int]$resp.paging.total
         $page++
     } while ($all.Count -lt $total)
-
     $all
 }
 
-function Get-Rule {
-    param([string]$RuleKey)
-    $base = ("{0}/api/rules/show" -f $SonarQubeUrl)
-    $url  = Add-QS -url $base -kv @{ key = $RuleKey }
-    $r = GET $url -Quiet
-    if ($r -and $r.rule) { return $r.rule }
-    Write-Warning ("Cannot retrieve rule {0}" -f $RuleKey)
+function Get-Rule([string]$RuleKey) {
+    $r = GET (Add-QS "$SonarQubeUrl/api/rules/show" @{ key = $RuleKey }) -Quiet
+    if ($r -and $r.rule) { $r.rule } else { $null }
+}
+
+function Get-SourceLines([string]$ComponentKey) {
+    # Try /raw (fast) unless policy says to use /show
+    if (-not $UseShowOnly) {
+        $raw = GET (Add-QS "$SonarQubeUrl/api/sources/raw" @{ key = $ComponentKey; branch = $Branch; pullRequest = $PullRequest }) -Quiet
+        if ($raw) { return ($raw -split "`n") }
+    }
+    # Fallback to /show
+    $show = GET (Add-QS "$SonarQubeUrl/api/sources/show" @{ key = $ComponentKey; branch = $Branch; pullRequest = $PullRequest }) -Quiet
+    if ($show -and $show.sources) { return @($show.sources | ForEach-Object { $_.code }) }
     $null
+}
+
+function Get-Snippet([string]$ComponentKey, [int]$Line) {
+    if (-not $Line -or $Line -le 0) { return "" }
+    $lines = Get-SourceLines $ComponentKey
+    if (-not $lines) { return "" }
+    $start = [Math]::Max(1, $Line - 3)
+    $end   = [Math]::Min($lines.Length, $Line + 3)
+    ($start..$end | ForEach-Object { "{0,4}: {1}" -f $_, $lines[$_-1] }) -join "`n"
 }
 
 function Strip-Html([string]$s) {
@@ -98,107 +100,114 @@ function Strip-Html([string]$s) {
     (($s -replace '<[^>]+>', '') -replace '\s+', ' ').Trim()
 }
 
-function Get-Snippet {
-    param([string]$ComponentKey, [int]$Line)
-
-    if (-not $Line -or $Line -le 0) { return "" }
-
-    # Try /sources/raw (fast)
-    $rawBase = ("{0}/api/sources/raw" -f $SonarQubeUrl)
-    $rawUrl  = Add-QS -url $rawBase -kv @{ key = $ComponentKey; branch = $Branch; pullRequest = $PullRequest }
-    $raw     = GET $rawUrl -Quiet
-    $lines = $null
-
-    if ($raw) {
-        $lines = $raw -split "`n"
-    } else {
-        # Fallback: /sources/show (JSON)
-        $showBase = ("{0}/api/sources/show" -f $SonarQubeUrl)
-        $showUrl  = Add-QS -url $showBase -kv @{ key = $ComponentKey; branch = $Branch; pullRequest = $PullRequest }
-        $show     = GET $showUrl -Quiet
-        if ($show -and $show.sources) {
-            $lines = @()
-            foreach ($row in $show.sources) { $lines += $row.code }
-        } else {
-            # Most likely 403 (missing "See Source Code")
-            Write-Warning ("No source for component (permission?): {0}" -f $ComponentKey)
-            return ""
-        }
-    }
-
-    $start = [Math]::Max(1, $Line - 3)
-    $end   = [Math]::Min($lines.Length, $Line + 3)
-
-    $sb = New-Object System.Text.StringBuilder
-    for ($i = $start; $i -le $end; $i++) {
-        [void]$sb.AppendLine(("{0,4}: {1}" -f $i, $lines[$i-1]))
-    }
-    $sb.ToString().TrimEnd()
-}
-
-# -------- MAIN --------
+# ------------ MAIN ------------
 $sv = Get-ServerVersion
-Write-Host ("SonarQube server version: {0}" -f $sv)
+Write-Host "SonarQube server version: $sv"
 
-# Token sanity check
-$valUrl = ("{0}/api/authentication/validate" -f $SonarQubeUrl)
-$val = GET $valUrl
-if (-not $val -or -not $val.valid) {
-    throw "Authentication failed. Check token/user permissions."
+$val = GET "$SonarQubeUrl/api/authentication/validate"
+if (-not $val -or -not $val.valid) { throw "Authentication failed. Check token and permissions (Browse + See Source Code)." }
+
+$ctx = @()
+if ($Branch)      { $ctx += "branch=$Branch" }
+if ($PullRequest) { $ctx += "PR=$PullRequest" }
+Write-Host ("Collecting issues for '{0}'{1} ..." -f $ProjectKey, ($ctx.Count ? " (" + ($ctx -join ", ") + ")" : ""))
+
+$issues = Get-Issues $ProjectKey
+if (-not $issues -or $issues.Count -eq 0) {
+    Write-Host "No issues found for the specified context."
+    return
 }
 
-Write-Host ("Collecting issues for project '{0}'{1}{2} ..." -f `
-    $ProjectKey, ($Branch -ne "" ? (" (branch=" + $Branch + ")") : ""), ($PullRequest -ne "" ? (" (PR=" + $PullRequest + ")") : ""))
+# Prepare concurrent work items (one per issue)
+# We fetch rule + snippet in parallel to speed up large projects
+$work = $issues | ForEach-Object {
+    # normalize line (some versions use textRange.startLine)
+    $line = if ($_.line) { [int]$_.line } elseif ($_.textRange -and $_.textRange.startLine) { [int]$_.textRange.startLine } else { $null }
+    [pscustomobject]@{
+        Issue       = $_
+        Line        = $line
+        Component   = $_.component
+        RuleKey     = $_.rule
+    }
+}
 
-$issues = Get-Issues -ProjectKey $ProjectKey
-$result = @()
+$results = $work | ForEach-Object -Parallel {
+    using module Microsoft.PowerShell.Utility
 
-foreach ($i in $issues) {
-    # line: issues API may return .line or .textRange.startLine
-    $line = $null
-    if ($i.PSObject.Properties.Name -contains 'line' -and $i.line) {
-        $line = [int]$i.line
-    } elseif ($i.PSObject.Properties.Name -contains 'textRange' -and $i.textRange -and $i.textRange.startLine) {
-        $line = [int]$i.textRange.startLine
+    # local helpers redefined inside parallel runspace
+    function Strip-Html([string]$s) {
+        if (-not $s) { return "" }
+        (($s -replace '<[^>]+>', '') -replace '\s+', ' ').Trim()
     }
 
-    $rule = Get-Rule -RuleKey $i.rule
+    # pull rule
+    $ruleResp = Invoke-RestMethod -Uri (("{0}/api/rules/show?key={1}" -f $using:SonarQubeUrl, [uri]::EscapeDataString($PSItem.RuleKey))) `
+                                  -Headers $using:Headers -Method Get `
+                                  @(@{SkipCertificateCheck=$true}[$using:Global:SkipTLS])
 
-    # normalize rule fields across versions
-    $ruleName = if ($rule -and $rule.name) { $rule.name } else { $i.rule }
-    $descHtml = if ($rule -and $rule.htmlDesc) { $rule.htmlDesc } elseif ($rule -and $rule.mdDesc) { $rule.mdDesc } else { "" }
-    $desc     = Strip-Html $descHtml
+    $rule = if ($ruleResp -and $ruleResp.rule) { $ruleResp.rule } else { $null }
 
-    # recommendation text (best effort across 2025.x)
-    $reco = ""
-    if ($rule) {
-        if ($rule.remediation) {
-            $gap = if ($rule.remediation.gapDescription) { $rule.remediation.gapDescription } else { "" }
-            $reco = Strip-Html (($rule.remediation.func + " " + $gap))
-        } elseif ($rule.debtRemFnBaseEffort) {
-            $reco = Strip-Html $rule.debtRemFnBaseEffort
-        } else {
-            $reco = $desc
+    # pull snippet
+    $snippet = ""
+    if ($PSItem.Line) {
+        # try raw first
+        $rawUrl = "{0}/api/sources/raw?key={1}" -f $using:SonarQubeUrl, [uri]::EscapeDataString($PSItem.Component)
+        if ($using:Branch)      { $rawUrl += "&branch=$([uri]::EscapeDataString($using:Branch))" }
+        if ($using:PullRequest) { $rawUrl += "&pullRequest=$([uri]::EscapeDataString($using:PullRequest))" }
+
+        $lines = $null
+        if (-not $using:UseShowOnly) {
+            try {
+                $raw = Invoke-RestMethod -Uri $rawUrl -Headers $using:Headers -Method Get @(@{SkipCertificateCheck=$true}[$using:Global:SkipTLS])
+                if ($raw) { $lines = $raw -split "`n" }
+            } catch { }
+        }
+        if (-not $lines) {
+            $showUrl = "{0}/api/sources/show?key={1}" -f $using:SonarQubeUrl, [uri]::EscapeDataString($PSItem.Component)
+            if ($using:Branch)      { $showUrl += "&branch=$([uri]::EscapeDataString($using:Branch))" }
+            if ($using:PullRequest) { $showUrl += "&pullRequest=$([uri]::EscapeDataString($using:PullRequest))" }
+            try {
+                $show = Invoke-RestMethod -Uri $showUrl -Headers $using:Headers -Method Get @(@{SkipCertificateCheck=$true}[$using:Global:SkipTLS])
+                if ($show -and $show.sources) { $lines = @($show.sources | ForEach-Object { $_.code }) }
+            } catch { }
+        }
+        if ($lines) {
+            $start = [Math]::Max(1, $PSItem.Line - 3)
+            $end   = [Math]::Min($lines.Length, $PSItem.Line + 3)
+            $snippet = ($start..$end | ForEach-Object { "{0,4}: {1}" -f $_, $lines[$_-1] }) -join "`n"
         }
     }
 
-    $snippet = if ($line) { Get-Snippet -ComponentKey $i.component -Line $line } else { "" }
+    # normalize rule fields
+    $ruleName = $rule?.name ?? $PSItem.RuleKey
+    $descHtml = $rule?.htmlDesc ?? $rule?.mdDesc
+    $desc     = Strip-Html $descHtml
+    $reco     = if ($rule?.remediation) {
+        Strip-Html ( ($rule.remediation.func ?? "") + " " + ($rule.remediation.gapDescription ?? "") )
+    } elseif ($rule?.debtRemFnBaseEffort) {
+        Strip-Html $rule.debtRemFnBaseEffort
+    } else {
+        $desc
+    }
 
-    $result += [PSCustomObject]@{
-        Project        = $ProjectKey
-        Branch         = ($Branch -ne "" ? $Branch : "main")
-        File           = $i.component
-        Line           = $line
-        Severity       = $i.severity
-        Type           = $i.type
-        RuleKey        = $i.rule
+    [pscustomobject]@{
+        File           = $PSItem.Component
+        Line           = $PSItem.Line
+        RuleKey        = $PSItem.RuleKey
         RuleName       = $ruleName
-        Message        = $i.message
         Description    = $desc
         Recommendation = $reco
         CodeSnippet    = $snippet
+        Severity       = $PSItem.Issue.severity
+        Type           = $PSItem.Issue.type
+        Message        = $PSItem.Issue.message
     }
-}
+} -ThrottleLimit $Throttle
 
-$result | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
-Write-Host ("Export complete: {0}" -f $OutputCsv)
+# assemble and export
+$branchOut = $Branch ? $Branch : "main"
+$final = $results | Select-Object @{n='Project';e={$ProjectKey}},
+                              @{n='Branch';e={$branchOut}},
+                              File, Line, Severity, Type, RuleKey, RuleName, Message, Description, Recommendation, CodeSnippet
+$final | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+Write-Host "Export complete: $OutputCsv"
