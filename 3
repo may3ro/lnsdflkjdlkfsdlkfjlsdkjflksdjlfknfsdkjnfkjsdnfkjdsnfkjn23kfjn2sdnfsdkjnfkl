@@ -1,15 +1,14 @@
 <#=====================================================================
   Export-SonarQubeIssuesWithSnippets_2025.4.2_FINAL.ps1
-  – Works on SonarQube 2025.4.2 (any edition)
-  – Returns line-level snippets for ABAP (and any language)
-  – Handles file-level issues gracefully
+  – 100% syntax-clean for PowerShell 5.1+
+  – Works on SonarQube 2025.4.2
 =====================================================================#>
 
 param(
-    [Parameter(Mandatory)][string]$ServerUrl,      # e.g. https://sonarqube.mycorp.com
-    [Parameter(Mandatory)][string]$Token,          # API token (Browse permission)
-    [Parameter(Mandatory)][string]$ProjectKey,     # exact project key
-    [Parameter(Mandatory)][string]$OutputPath,     # full CSV path
+    [Parameter(Mandatory)][string]$ServerUrl,
+    [Parameter(Mandatory)][string]$Token,
+    [Parameter(Mandatory)][string]$ProjectKey,
+    [Parameter(Mandatory)][string]$OutputPath,
     [int]$SnippetLinesBefore = 3,
     [int]$SnippetLinesAfter  = 3,
     [int]$PageSize           = 100,
@@ -30,20 +29,20 @@ $headers = @{
 $global:PSDefaultParameterValues['Invoke-RestMethod:SkipCertificateCheck'] = $true
 
 # --------------------------------------------------------------------
-# 1. Verify connection – use a **real JSON endpoint**
+# 1. Verify connection (JSON endpoint)
 $testUri = "$ServerUrl/api/system/status"
 try {
     $status = Invoke-RestMethod -Uri $testUri -Headers $headers -Method Get -ErrorAction Stop
-    Write-Info "Connected to SonarQube $($status.version) – status: $($status.status)"
+    Write-Info "Connected to SonarQube $($status.version)"
 }
 catch {
     Write-Error "Connection failed: $($_.Exception.Message)"
-    if ($_.Exception.Response.StatusCode -eq 401) { Write-Warn "Regenerate token (My Account > Security)" }
+    if ($_.Exception.Response.StatusCode -eq 401) { Write-Warn "Regenerate token" }
     exit 1
 }
 
 # --------------------------------------------------------------------
-# 2. Rule details (incl. CWE for 2025.4+)
+# 2. Rule details
 function Get-RuleDetails {
     param([string]$RuleKey)
     $uri = "$ServerUrl/api/rules/show?key=$RuleKey&actives_only=true"
@@ -65,13 +64,13 @@ function Get-RuleDetails {
 }
 
 # --------------------------------------------------------------------
-# 3. Code snippet – **now logs when line is missing**
+# 3. Code snippet
 function Get-CodeSnippet {
     param([string]$ComponentKey, [int]$LineNumber)
 
     if (-not $LineNumber) {
         Write-Warn "No line number for component: $ComponentKey → File-level issue"
-        return 'File-level issue (no line number in SonarQube)'
+        return 'File-level issue (no line number)'
     }
 
     $uri = "$ServerUrl/api/sources/raw?key=$ComponentKey"
@@ -93,12 +92,12 @@ function Get-CodeSnippet {
     }
     catch {
         Write-Warn "Source fetch failed for $ComponentKey (Line $LineNumber): $($_.Exception.Message)"
-        return "Source unavailable (404 / permission / deleted)"
+        return "Source unavailable"
     }
 }
 
 # --------------------------------------------------------------------
-# 4. Pull issues (pagination)
+# 4. Pull issues
 $allIssues = @()
 $page = 1
 $resolved = if ($IncludeResolved) { '' } else { '&resolved=false' }
@@ -121,12 +120,12 @@ do {
 } while ($allIssues.Count -lt $resp.paging.total -and $issues.Count -gt 0)
 
 if ($allIssues.Count -eq 0) {
-    Write-Warn "No issues returned. Verify ProjectKey, token scope, or add -IncludeResolved"
+    Write-Warn "No issues found. Use -IncludeResolved or check ProjectKey."
     exit 0
 }
 
 # --------------------------------------------------------------------
-# 5. Build CSV rows
+# 5. Build export
 $export = @()
 $cnt = 0
 foreach ($i in $allIssues) {
@@ -152,8 +151,8 @@ foreach ($i in $allIssues) {
 Write-Progress -Activity "Processing" -Completed
 
 # --------------------------------------------------------------------
-# 6. Export
+# 6. Export CSV
 $export | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-Write-Info "SUCCESS: Exported $($export.Count) issues → $OutputPath"
+Write-Info "Exported $($export.Count) issues → $OutputPath"
 Write-Info "Sample row:"
 $export | Select-Object -First 1 | Format-List
