@@ -1,9 +1,4 @@
-<#=====================================================================
-  Export-ABAPSonarSnippets_PS7_FIXED.ps1
-  – Fully compatible with PowerShell 7.5.4
-  – No parsing errors (uses ${page}, safe string formatting)
-  – Extracts ABAP snippets + recommendations from SonarQube 2025.4.2
-=====================================================================#>
+# Replace entire script with this:
 
 [CmdletBinding()]
 param(
@@ -18,97 +13,55 @@ param(
     [switch]$IncludeCWE
 )
 
-# --------------------------------------------------------------------
 function Write-Info   { param([string]$m) Write-Host "[INFO]  $m" -ForegroundColor Cyan }
 function Write-Warn   { param([string]$m) Write-Host "[WARN]  $m" -ForegroundColor Yellow }
 function Write-Error  { param([string]$m) Write-Host "[ERROR] $m" -ForegroundColor Red }
 
-# --------------------------------------------------------------------
-$headers = @{
-    Authorization = "Basic $([Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Token")))"
-    Accept        = 'application/json'
-}
+$headers = @{ Authorization = "Basic $([Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Token")))"; Accept = 'application/json' }
+$ProgressPreference = 'SilentlyContinue'
 
-# --------------------------------------------------------------------
-# 1. Verify connection
+# 1. Verify
 $testUri = "$ServerUrl/api/system/status"
-try {
-    $status = Invoke-RestMethod -Uri $testUri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
-    Write-Info "Connected to SonarQube $($status.version) - Status: $($status.status)"
-} catch {
-    Write-Error "Connection failed: $($_.Exception.Message)"
-    if ($_.Exception.Response.StatusCode -eq 401) { Write-Warn "Invalid token or missing 'See Source Code' permission" }
-    return
-}
+try { $status = Invoke-RestMethod -Uri $testUri -Headers $headers -SkipCertificateCheck -ErrorAction Stop; Write-Info "Connected to $($status.version)" }
+catch { Write-Error "Connection failed: $($_.Exception.Message)"; return }
 
-# --------------------------------------------------------------------
 # 2. Rule details
-function Get-RuleDetails {
-    param([string]$RuleKey)
+function Get-RuleDetails { param([string]$RuleKey)
     $uri = "$ServerUrl/api/rules/show?key=$RuleKey&actives_only=true"
     try {
         $r = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
         $desc = ($r.rule.htmlDesc -replace '<[^>]+>', '' -replace "`r`n","`n").Trim()
-        return @{
-            Recommendation = ($desc -split "`n" | ForEach-Object Trim | Where-Object {$_}) -join ' '
-            Effort        = $r.rule.remedialEffort ?? 'Unknown'
-            CWE           = ($IncludeCWE -and $r.rule.cwe) ? ($r.rule.cwe -join ', ') : ''
-        }
-    } catch {
-        Write-Warn "Rule $RuleKey failed: $($_.Exception.Message)"
-        return @{ Recommendation = 'N/A'; Effort = 'Unknown'; CWE = '' }
-    }
+        return @{ Recommendation = ($desc -split "`n" | Where-Object {$_} | ForEach-Object Trim) -join ' '; Effort = $r.rule.remedialEffort ?? 'Unknown'; CWE = ($IncludeCWE -and $r.rule.cwe) ? ($r.rule.cwe -join ', ') : '' }
+    } catch { Write-Warn "Rule $RuleKey failed: $($_.Exception.Message)"; return @{ Recommendation = 'N/A'; Effort = 'Unknown'; CWE = '' } }
 }
 
-# --------------------------------------------------------------------
 # 3. Code snippet
-function Get-CodeSnippet {
-    param([string]$ComponentKey, [int]$LineNumber)
-
-    if (-not $LineNumber) {
-        Write-Warn "File-level issue: $ComponentKey"
-        return 'File-level issue (no line number)'
-    }
-
+function Get-CodeSnippet { param([string]$ComponentKey, [int]$LineNumber)
+    if (-not $LineNumber) { Write-Warn "File-level: $ComponentKey"; return 'File-level issue' }
     $uri = "$ServerUrl/api/sources/raw?key=$ComponentKey"
     try {
-        $response = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -Method Get -ResponseHeadersVariable _
-        $stream = $response.Content.ReadAsStreamAsync().Result
-        $reader = [System.IO.StreamReader]::new($stream, [Text.Encoding]::UTF8)
-        $source = $reader.ReadToEnd()
-        $reader.Close()
-
-        $lines = $source -split "`n" | Where-Object { $_ -ne '' }
-        if ($lines.Count -eq 0) { return 'Empty source file' }
-
+        $resp = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
+        $lines = ($resp -split "`n" | Where-Object { $_ -ne '' })
+        if ($lines.Count -eq 0) { return 'Empty file' }
         $start = [Math]::Max(1, $LineNumber - $SnippetLinesBefore)
-        $end   = [Math]::Min($lines.Count, $LineNumber + $SnippetLinesAfter)
-
-        $snippet = for ($i = $start-1; $i -lt $end; $i++) {
-            "Line $($i+1): $($lines[$i])"
-        }
+        $end = [Math]::Min($lines.Count, $LineNumber + $SnippetLinesAfter)
+        $snippet = for ($i = $start-1; $i -lt $end; $i++) { "Line $($i+1): $($lines[$i])" }
         return $snippet -join "`n"
-    } catch {
-        Write-Warn "Snippet failed for $ComponentKey (Line $LineNumber): $($_.Exception.Message)"
-        return 'Source access denied'
-    }
+    } catch { Write-Warn "Snippet failed: $ComponentKey (Line $LineNumber) - $($_.Exception.Message)"; return 'Source unavailable' }
 }
 
-# --------------------------------------------------------------------
-# 4. Fetch issues
-# 4. Fetch ALL issues + debug
+# 4. Fetch ALL issues
 $allIssues = @()
 $page = 1
 do {
-    $params = "componentKeys=$ProjectKey&ps=$PageSize&p=$page"
-    if (-not $IncludeResolved) { $params += "&resolved=false" }
-    $uri = "$ServerUrl/api/issues/search?$params"
-    Write-Info "Fetching page ${page} (ALL ISSUES)..."
+    $params = @{ componentKeys = $ProjectKey; ps = $PageSize; p = $page }
+    if (-not $IncludeResolved) { $params.resolved = 'false' }
+    $uri = "$ServerUrl/api/issues/search?" + ($params.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '&'
+    Write-Info "Fetching page ${page}..."
     try {
         $resp = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
         $issues = $resp.issues
         $allIssues += $issues
-        $issues | ForEach-Object { Write-Info "Issue: $($_.rule) | Line: $($_.line) | Type: $($_.type)" }
         Write-Info "   → $($issues.Count) issues (total: $($allIssues.Count))"
         $page++
     } catch {
@@ -117,13 +70,16 @@ do {
     }
 } while ($allIssues.Count -lt $resp.paging.total -and $issues.Count -gt 0)
 
-# --------------------------------------------------------------------
-# 5. Build export
+if ($allIssues.Count -eq 0) {
+    Write-Warn "No issues found. Check scan logs or add test vulnerabilities."
+    return
+}
+
+# 5. Export
 $export = foreach ($i in $allIssues) {
     $rule = Get-RuleDetails -RuleKey $i.rule
     $snippet = Get-CodeSnippet -ComponentKey $i.component -LineNumber $i.line
     $file = ($i.component -replace "^$ProjectKey`:", '').Split('/')[-1]
-
     [PSCustomObject]@{
         'Rule ID'        = $i.rule
         'Severity'       = $i.severity
@@ -138,11 +94,8 @@ $export = foreach ($i in $allIssues) {
     }
 }
 
-# --------------------------------------------------------------------
-# 6. Export CSV
+# 6. Save
 $export | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-Write-Info "SUCCESS: Exported $($export.Count) ABAP issues to $OutputPath"
-
-# Show sample
-Write-Info "Sample Critical Issue:"
-$export | Where-Object Severity -eq 'CRITICAL' | Select-Object -First 1 | Format-List
+Write-Info "Exported $($export.Count) issues to $OutputPath"
+Write-Info "Sample:"
+$export | Select-Object -First 1 | Format-List
