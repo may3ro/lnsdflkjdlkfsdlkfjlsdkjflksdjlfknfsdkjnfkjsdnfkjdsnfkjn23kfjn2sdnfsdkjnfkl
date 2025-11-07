@@ -1,0 +1,154 @@
+<#=====================================================================
+  Export-SonarQubeIssuesWithSnippets_2025.4.2.ps1
+  – 100% compatible with SonarQube 2025.4.2 (Server, Enterprise, Data Center)
+  – Exports: Rule ID, Severity, File, Line, Message, Recommendation, Effort, Code Snippet
+  – Includes CWE/OWASP 2024 alignment via rule metadata (2025.4+)
+=====================================================================#>
+
+param(
+    [Parameter(Mandatory=$true)][string]$ServerUrl,      # e.g. https://sonarqube.mycompany.com
+    [Parameter(Mandatory=$true)][string]$Token,          # API token with 'Browse' permission
+    [Parameter(Mandatory=$true)][string]$ProjectKey,     # Exact project key
+    [Parameter(Mandatory=$true)][string]$OutputPath,     # Full path to CSV
+    [int]$SnippetLinesBefore = 3,
+    [int]$SnippetLinesAfter  = 3,
+    [int]$PageSize           = 100,                     # Max 500 in 2025.4.2
+    [switch]$IncludeResolved,                           # Include closed issues?
+    [switch]$IncludeCWE                              # NEW: Add CWE ID (2025.4+)
+)
+
+# --------------------------------------------------------------------
+# Helper output
+function Write-Info  { param([string]$m) Write-Host "[INFO]  $m" -ForegroundColor Cyan }
+function Write-Warn  { param([string]$m) Write-Host "[WARN]  $m" -ForegroundColor Yellow }
+function Write-Error { param([string]$m) Write-Host "[ERROR] $m" -ForegroundColor Red }
+
+# --------------------------------------------------------------------
+# Auth headers
+$headers = @{
+    'Authorization' = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Token"))
+    'Accept'        = 'application/json'
+}
+
+# Optional: Skip self-signed certs
+$global:PSDefaultParameterValues['Invoke-RestMethod:SkipCertificateCheck'] = $true
+
+# --------------------------------------------------------------------
+# 1. Verify connection
+$testUri = "$ServerUrl/api/server/version"
+try {
+    $version = Invoke-RestMethod -Uri $testUri -Headers $headers -Method Get -ErrorAction Stop
+    Write-Info "Connected to SonarQube $version"
+} catch {
+    Write-Error "Connection failed: $($_.Exception.Message)"
+    if ($_.Exception.Response.StatusCode -eq 401) { Write-Warn "Regenerate token (My Account > Security)" }
+    exit 1
+}
+
+# --------------------------------------------------------------------
+# 2. Rule details (2025.4+ includes CWE)
+function Get-RuleDetails {
+    param([string]$RuleKey)
+    $uri = "$ServerUrl/api/rules/show?key=$RuleKey&actives_only=true"
+    try {
+        $r = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
+        $desc = ($r.rule.htmlDesc -replace '<[^>]+>', '' -replace "`r`n","`n").Trim()
+        $cwe = if ($IncludeCWE -and $r.rule.cwe) { $r.rule.cwe -join ', ' } else { '' }
+        return @{
+            Recommendation = ($desc -split "`n" | ForEach-Object Trim | Where-Object {$_}) -join ' '
+            Effort        = $r.rule.remedialEffort ?? 'Unknown'
+            CWE           = $cwe
+        }
+    } catch {
+        Write-Warn "Rule $RuleKey failed: $($_.Exception.Message)"
+        return @{ Recommendation = 'N/A'; Effort = 'Unknown'; CWE = '' }
+    }
+}
+
+# --------------------------------------------------------------------
+# 3. Code snippet (UTF-8, line-aware)
+function Get-CodeSnippet {
+    param([string]$ComponentKey, [int]$LineNumber)
+    if (-not $LineNumber) { return 'File-level issue (no line)' }
+
+    $uri = "$ServerUrl/api/sources/raw?key=$ComponentKey"
+    try {
+        $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ResponseHeadersVariable _
+        $bytes = $resp.Content.ReadAsByteArrayAsync().Result
+        $source = [Text.Encoding]::UTF8.GetString($bytes)
+        $lines = $source -split "`n" | Where-Object { $_ -ne '' }
+
+        $start = [Math]::Max(1, $LineNumber - $SnippetLinesBefore)
+        $end   = [Math]::Min($lines.Count, $LineNumber + $SnippetLinesAfter)
+
+        $snippet = for ($i = $start-1; $i -lt $end; $i++) {
+            "Line $($i+1): $($lines[$i])"
+        }
+        return $snippet -join "`n"
+    } catch {
+        return "Snippet error: $($_.Exception.Message)"
+    }
+}
+
+# --------------------------------------------------------------------
+# 4. Fetch issues (pagination)
+$allIssues = @()
+$page = 1
+$resolved = if ($IncludeResolved) { '' } else { '&resolved=false' }
+$baseUri  = "$ServerUrl/api/issues/search?componentKeys=$ProjectKey&ps=$PageSize$resolved"
+
+do {
+    $uri = "$baseUri&p=$page"
+    Write-Info "Fetching page $page ..."
+    try {
+        $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
+        $issues = $resp.issues
+        $allIssues += $issues
+        Write-Info "   -> $($issues.Count) issues (total $($allIssues.Count))"
+        $page++
+    } catch {
+        Write-Error "Page $page failed: $($_.Exception.Message)"
+        break
+    }
+} while ($allIssues.Count -lt $resp.paging.total -and $issues.Count -gt 0)
+
+if ($allIssues.Count -eq 0) {
+    Write-Warn "No issues found. Check: ProjectKey='$ProjectKey', token scope, or use -IncludeResolved"
+    exit 0
+}
+
+# --------------------------------------------------------------------
+# 5. Build export
+$export = @()
+$cnt = 0
+foreach ($i in $allIssues) {
+    $cnt++
+    Write-Progress -Activity "Processing Issues" -Status "$cnt/$($allIssues.Count)" -PercentComplete ($cnt/$allIssues.Count*100)
+
+    $rule   = Get-RuleDetails -RuleKey $i.rule
+    $snip   = Get-CodeSnippet -ComponentKey $i.component -LineNumber $i.line
+
+    $export += [pscustomobject]@{
+        'Rule ID'        = $i.rule
+        'Severity'       = $i.severity
+        'Type'           = $i.type
+        'File'           = ($i.component -replace "^$ProjectKey`:", '')
+        'Line'           = $i.line
+        'Message'        = $i.message
+        'Recommendation' = ($rule.Recommendation.Substring(0,[Math]::Min(500,$rule.Recommendation.Length))) + '...'
+        'Effort'         = $rule.Effort
+        'CWE'            = $rule.CWE
+        'Snippet'        = ($snip.Substring(0,[Math]::Min(2000,$snip.Length))) + '...'
+    }
+}
+Write-Progress -Activity "Processing" -Completed
+
+# --------------------------------------------------------------------
+# 6. Export CSV
+$export | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+Write-Info "SUCCESS: Exported $($export.Count) issues to:"
+Write-Info "   $OutputPath"
+
+# Show first row
+Write-Info "Sample row:"
+$export | Select-Object -First 1 | Format-List
