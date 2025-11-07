@@ -1,6 +1,6 @@
 # ====================================================================
-# SonarQube ABAP Code Security Export (PS 5.1 compatible)
-# - Exports issues with rule info and code snippets
+# SonarQube ABAP Code Security Export (PS 5.1 safe)
+# - No "$Var:" patterns; only -f formatting / concatenation
 # ====================================================================
 
 # ---- CONFIG ----
@@ -13,10 +13,9 @@ $OutputFile   = "SonarQube_ABAP_Security_Report.csv"
 # [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 
 # ---- AUTH ----
-# IMPORTANT: use subexpression so the trailing ':' doesn't break parsing
-$pair         = "$($Token):"
-$encodedToken = [System.Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes($pair))
-$Headers      = @{ Authorization = "Basic $encodedToken" }
+$pair         = ($Token + ":")                                    # no interpolation
+$encodedToken = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+$Headers      = @{ "Authorization" = ("Basic {0}" -f $encodedToken) }
 
 # ---- HELPERS ----
 function Invoke-GET {
@@ -24,8 +23,8 @@ function Invoke-GET {
     try {
         return Invoke-RestMethod -Uri $Url -Headers $Headers -Method Get -ErrorAction Stop
     } catch {
-        $msg = if ($_.Exception) { $_.Exception.Message } else { "$_" }
-        Write-Warning "HTTP GET failed: $Url -> $msg"
+        $msg = if ($_.Exception) { $_.Exception.Message } else { ("" + $_) }
+        Write-Warning ("HTTP GET failed: {0} -> {1}" -f $Url, $msg)
         return $null
     }
 }
@@ -38,7 +37,8 @@ function Get-SonarQubeIssues {
     $AllIssues = @()
 
     do {
-        $url = "$SonarQubeUrl/api/issues/search?componentKeys=$([uri]::EscapeDataString($ProjectKey))&p=$Page&ps=$PageSize"
+        $url = ("{0}/api/issues/search?componentKeys={1}&p={2}&ps={3}" -f `
+                $SonarQubeUrl, [uri]::EscapeDataString($ProjectKey), $Page, $PageSize)
         $resp = Invoke-GET -Url $url
         if (-not $resp) { break }
 
@@ -53,10 +53,10 @@ function Get-SonarQubeIssues {
 
 function Get-RuleDetails {
     param([string]$RuleKey)
-    $url  = "$SonarQubeUrl/api/rules/show?key=$([uri]::EscapeDataString($RuleKey))"
+    $url  = ("{0}/api/rules/show?key={1}" -f $SonarQubeUrl, [uri]::EscapeDataString($RuleKey))
     $resp = Invoke-GET -Url $url
     if ($resp -and $resp.rule) { return $resp.rule }
-    Write-Warning "Cannot retrieve rule $RuleKey"
+    Write-Warning ("Cannot retrieve rule {0}" -f $RuleKey)
     return $null
 }
 
@@ -65,7 +65,7 @@ function Get-CodeSnippet {
 
     if (-not $Line -or $Line -le 0) { return "" }
 
-    $rawUrl  = "$SonarQubeUrl/api/sources/raw?key=$([uri]::EscapeDataString($ComponentKey))"
+    $rawUrl  = ("{0}/api/sources/raw?key={1}" -f $SonarQubeUrl, [uri]::EscapeDataString($ComponentKey))
     $rawText = Invoke-GET -Url $rawUrl
     if (-not $rawText) { return "" }
 
@@ -83,12 +83,11 @@ function Get-CodeSnippet {
 function Strip-Html {
     param([string]$s)
     if (-not $s) { return "" }
-    # remove HTML tags and squeeze whitespace
     (($s -replace '<[^>]+>', '') -replace '\s+', ' ').Trim()
 }
 
 # ---- MAIN ----
-Write-Host "Retrieving issues for project '$ProjectKey' ..."
+Write-Host ("Retrieving issues for project '{0}' ..." -f $ProjectKey)
 $issues = Get-SonarQubeIssues -ProjectKey $ProjectKey
 
 $result = @()
@@ -104,21 +103,17 @@ foreach ($issue in $issues) {
 
     $rule = Get-RuleDetails -RuleKey $issue.rule
 
-    # SonarQube rule fields vary by version; we normalize sensible fields
     $ruleName = if ($rule -and $rule.name) { $rule.name } else { $issue.rule }
     $desc     = if ($rule -and $rule.htmlDesc) { Strip-Html $rule.htmlDesc } else { "" }
 
-    # Best-effort recommendation text: some SQ versions have remediation metadata, others only in htmlDesc
+    # Best-effort recommendation text (varies by SonarQube version)
     $reco = ""
     if ($rule) {
         if ($rule.remediation) {
-            # Some editions expose remediation structure
-            $reco = Strip-Html ($rule.remediation.func + " " + $rule.remediation.gapDescription)
+            $reco = Strip-Html (($rule.remediation.func + " " + $rule.remediation.gapDescription))
         } elseif ($rule.debtRemFnBaseEffort) {
-            # Older field name
             $reco = Strip-Html $rule.debtRemFnBaseEffort
         } else {
-            # Fallback: try to extract a short “Fix/How to fix” phrase from description if present
             $reco = $desc
         }
     }
@@ -142,4 +137,4 @@ foreach ($issue in $issues) {
 
 Write-Host "Exporting to CSV..."
 $result | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
-Write-Host "Export complete: $OutputFile"
+Write-Host ("Export complete: {0}" -f $OutputFile)
