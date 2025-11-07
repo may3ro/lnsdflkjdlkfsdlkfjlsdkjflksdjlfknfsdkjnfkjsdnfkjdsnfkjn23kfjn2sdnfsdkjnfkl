@@ -2,13 +2,11 @@
 param(
     [Parameter(Mandatory)][string]$ServerUrl,
     [Parameter(Mandatory)][string]$Token,
-    [Parameter(Mandatory)][string]$ProjectKey,
+    [Parameter(Mandatory)][string]$ProjectKey,  # Confirm from UI (Projects > Key where 68 issues shown)
     [Parameter(Mandatory)][string]$OutputPath,
     [int]$SnippetLinesBefore = 5,
     [int]$SnippetLinesAfter = 5,
-    [int]$PageSize = 500,  # Max for 2025.4.2
-    [switch]$IncludeResolved,
-    [switch]$IncludeCWE
+    [int]$PageSize = 500
 )
 
 function Write-Info { param([string]$m) Write-Host "[INFO] $m" -ForegroundColor Cyan }
@@ -18,24 +16,24 @@ function Write-Error { param([string]$m) Write-Host "[ERROR] $m" -ForegroundColo
 $headers = @{ Authorization = "Basic $([Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Token")))"; Accept = 'application/json' }
 $ProgressPreference = 'SilentlyContinue'
 
-# Verify Connection
+# Verify
 $testUri = "$ServerUrl/api/system/status"
 try { $status = Invoke-RestMethod -Uri $testUri -Headers $headers -SkipCertificateCheck -ErrorAction Stop; Write-Info "Connected to $($status.version)" }
 catch { Write-Error "Connection failed: $($_.Exception.Message)"; return }
 
-# Rule Details
+# Rule Details (CWE for Security)
 function Get-RuleDetails { param([string]$RuleKey)
     $uri = "$ServerUrl/api/rules/show?key=$RuleKey&actives_only=true"
     try {
         $r = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
         $desc = ($r.rule.htmlDesc -replace '<[^>]+>', '' -replace "`r`n","`n").Trim()
-        return @{ Recommendation = ($desc -split "`n" | Where-Object {$_} | ForEach-Object Trim) -join ' '; Effort = $r.rule.remedialEffort ?? 'Unknown'; CWE = ($IncludeCWE -and $r.rule.cwe) ? ($r.rule.cwe -join ', ') : '' }
+        return @{ Recommendation = ($desc -split "`n" | Where-Object {$_} | ForEach-Object Trim) -join ' '; Effort = $r.rule.remedialEffort ?? 'Unknown'; CWE = $r.rule.cwe ? ($r.rule.cwe -join ', ') : '' }
     } catch { Write-Warn "Rule $RuleKey failed"; return @{ Recommendation = 'N/A'; Effort = 'Unknown'; CWE = '' } }
 }
 
 # Code Snippet
 function Get-CodeSnippet { param([string]$ComponentKey, [int]$LineNumber)
-    if (-not $LineNumber) { Write-Warn "File-level: $ComponentKey"; return 'File-level issue (review full source)' }
+    if (-not $LineNumber) { Write-Warn "File-level hotspot: $ComponentKey (e.g., review RFC auth)"; return 'File-level security hotspot: Review full source for risks like CWE-284 (auth bypass, SAP Note 2800347)' }
     $uri = "$ServerUrl/api/sources/raw?key=$ComponentKey"
     try {
         $source = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
@@ -45,22 +43,22 @@ function Get-CodeSnippet { param([string]$ComponentKey, [int]$LineNumber)
         $end = [Math]::Min($lines.Count, $LineNumber + $SnippetLinesAfter)
         $snippet = for ($i = $start-1; $i -lt $end; $i++) { "Line $($i+1): $($lines[$i])" }
         return $snippet -join "`n"
-    } catch { Write-Warn "Snippet failed: $ComponentKey (Line $LineNumber)"; return 'Source unavailable (check perms)' }
+    } catch { Write-Warn "Snippet failed: $ComponentKey (Line $LineNumber)"; return 'Source unavailable (check "See Source Code" perm)' }
 }
 
-# Fetch All Issues
+# Fetch All Issues (Include Resolved for UI Match)
 $allIssues = @()
 $page = 1
 do {
     $params = @{ componentKeys = $ProjectKey; ps = $PageSize; p = $page }
-    if (-not $IncludeResolved) { $params.resolved = 'false' }
     $uri = "$ServerUrl/api/issues/search?" + ($params.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '&'
     Write-Info "Fetching page ${page}..."
     try {
         $resp = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
+        Write-Info "Raw: total=$($resp.paging.total), page=$($resp.paging.pageIndex)/$($resp.paging.pages)"
         $issues = $resp.issues
         $allIssues += $issues
-        Write-Info "   → $($issues.Count) issues (total: $($allIssues.Count))"
+        Write-Info "   → $($issues.Count) issues (cumulative: $($allIssues.Count))"
         $page++
     } catch {
         Write-Error "API failed on page ${page}: $($_.Exception.Message)"
@@ -69,12 +67,20 @@ do {
 } while ($allIssues.Count -lt $resp.paging.total -and $issues.Count -gt 0)
 
 if ($allIssues.Count -eq 0) {
-    Write-Warn "No issues found in SonarQube. Verify scan in UI (Projects > Issues) or re-scan TFS folders with ABAP plugin."
+    Write-Warn "0 issues via API. UI 68 may be for different project/key or statuses. Confirm Project Key from UI (Projects > Key)."
+    return
+}
+
+# Filter to Security Locally (VULNERABILITY + SECURITY_HOTSPOT)
+$securityIssues = $allIssues | Where-Object { $_.type -in 'VULNERABILITY', 'SECURITY_HOTSPOT' }
+
+if ($securityIssues.Count -eq 0) {
+    Write-Warn "0 Security issues (UI shows 68—check if types match VULNERABILITY/SECURITY_HOTSPOT or use full export)."
     return
 }
 
 # Export
-$export = foreach ($i in $allIssues) {
+$export = foreach ($i in $securityIssues) {
     $rule = Get-RuleDetails -RuleKey $i.rule
     $snippet = Get-CodeSnippet -ComponentKey $i.component -LineNumber $i.line
     $file = ($i.component -replace "^$ProjectKey`:", '').Split('/')[-1]
@@ -93,6 +99,6 @@ $export = foreach ($i in $allIssues) {
 }
 
 $export | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-Write-Info "Exported $($export.Count) issues to $OutputPath for government report merge"
-Write-Info "Sample (High/CRITICAL):"
+Write-Info "Exported $($export.Count) Security issues to $OutputPath (match UI 68)"
+Write-Info "Sample CRITICAL/HIGH:"
 $export | Where-Object Severity -in 'CRITICAL','HIGH' | Select-Object -First 1 | Format-List
