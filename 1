@@ -1,3 +1,81 @@
+# Returns a normalized hashtable for a rule:
+#  @{ Key; Name; HtmlOrMd; RemediationText }
+function Get-RuleRich([string]$RuleKey) {
+  # 1) Try /rules/show
+  try {
+    $r = Invoke-RestMethod -Uri ("$Base/api/rules/show?key={0}" -f [uri]::EscapeDataString($RuleKey)) -Headers $H -Method Get -ErrorAction Stop
+    if ($r -and $r.rule) {
+      $rule = $r.rule
+      $desc = $rule.htmlDesc ?? $rule.mdDesc ?? $rule.htmlDescription ?? $rule.markdownDescription ?? $rule.description ?? $rule.htmlNote ?? $rule.note
+      $rem  = ''
+      if ($rule.remediation) {
+        $rem = ((($rule.remediation.func) ? $rule.remediation.func : '') + ' ' +
+               (($rule.remediation.gapDescription) ? $rule.remediation.gapDescription : ''))
+      } elseif ($rule.debtRemFnBaseEffort) {
+        $rem = $rule.debtRemFnBaseEffort
+      }
+      return @{
+        Key            = $rule.key
+        Name           = ($rule.name ?? $RuleKey)
+        HtmlOrMd       = $desc
+        RemediationTxt = $rem
+      }
+    }
+  } catch { }
+
+  # 2) Fallback: /rules/search?rule_key=<key>
+  try {
+    $s = Invoke-RestMethod -Uri ("$Base/api/rules/search?rule_key={0}" -f [uri]::EscapeDataString($RuleKey)) -Headers $H -Method Get -ErrorAction Stop
+    if ($s -and $s.rules -and $s.rules.Count -gt 0) {
+      $rule = $s.rules[0]
+      $desc = $rule.htmlDesc ?? $rule.mdDesc ?? $rule.htmlDescription ?? $rule.markdownDescription ?? $rule.description ?? $rule.htmlNote ?? $rule.note
+      $rem  = ''
+      if ($rule.remediation) {
+        $rem = ((($rule.remediation.func) ? $rule.remediation.func : '') + ' ' +
+               (($rule.remediation.gapDescription) ? $rule.remediation.gapDescription : ''))
+      } elseif ($rule.debtRemFnBaseEffort) {
+        $rem = $rule.debtRemFnBaseEffort
+      }
+      return @{
+        Key            = $rule.key
+        Name           = ($rule.name ?? $RuleKey)
+        HtmlOrMd       = $desc
+        RemediationTxt = $rem
+      }
+    }
+  } catch { }
+
+  # 3) Nothing found
+  return @{
+    Key            = $RuleKey
+    Name           = $RuleKey
+    HtmlOrMd       = ''
+    RemediationTxt = ''
+  }
+}
+
+
+
+[pscustomobject]@{
+  Project        = $ProjectKey
+  Branch         = ($Branch -ne '' ? $Branch : 'main')
+  File           = $i.component
+  Line           = $line
+  Severity       = $i.severity
+  Type           = $i.type
+  RuleKey        = $i.rule
+  RuleName       = $ruleName
+  Message        = $i.message
+  WhyIssue       = $why
+  Description    = $descPlain
+  HowToFix       = $how
+  Recommendation = $recoTxt
+  CodeSnippet    = (Snippet $i.component $line)
+}
+
+
+
 $k='abap:SXXXX'   # put a real key from your CSV
 irm "$Base/api/rules/show?key=$([uri]::EscapeDataString($k))" -Headers $H | ConvertTo-Json -Depth 6
 irm "$Base/api/rules/search?rule_key=$([uri]::EscapeDataString($k))" -Headers $H | ConvertTo-Json -Depth 6
+
