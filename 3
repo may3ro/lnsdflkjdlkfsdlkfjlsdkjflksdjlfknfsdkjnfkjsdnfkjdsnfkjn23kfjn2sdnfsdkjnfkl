@@ -96,37 +96,26 @@ function Get-CodeSnippet {
 
 # --------------------------------------------------------------------
 # 4. Fetch issues
+# 4. Fetch ALL issues + debug
 $allIssues = @()
 $page = 1
 do {
-    $params = @{
-        componentKeys = $ProjectKey
-        types         = 'VULNERABILITY,BUG'
-        ps            = $PageSize
-        p             = $page
-    }
-    if (-not $IncludeResolved) { $params.resolved = 'false' }
-
-    $uri = "$ServerUrl/api/issues/search?" + ($params.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '&'
-
-    Write-Info "Fetching page ${page}..."
+    $params = "componentKeys=$ProjectKey&ps=$PageSize&p=$page"
+    if (-not $IncludeResolved) { $params += "&resolved=false" }
+    $uri = "$ServerUrl/api/issues/search?$params"
+    Write-Info "Fetching page ${page} (ALL ISSUES)..."
     try {
         $resp = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
         $issues = $resp.issues
         $allIssues += $issues
+        $issues | ForEach-Object { Write-Info "Issue: $($_.rule) | Line: $($_.line) | Type: $($_.type)" }
         Write-Info "   → $($issues.Count) issues (total: $($allIssues.Count))"
         $page++
     } catch {
-        # FIXED: Use ${page} to avoid parser error
         Write-Error "API failed on page ${page}: $($_.Exception.Message)"
         break
     }
 } while ($allIssues.Count -lt $resp.paging.total -and $issues.Count -gt 0)
-
-if ($allIssues.Count -eq 0) {
-    Write-Warn "No vulnerabilities or bugs found. Re-scan project or remove type filter."
-    return
-}
 
 # --------------------------------------------------------------------
 # 5. Build export
