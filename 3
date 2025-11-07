@@ -71,7 +71,11 @@ function Get-RuleDetails {
 # 3. Code snippet
 function Get-CodeSnippet {
     param([string]$ComponentKey, [int]$LineNumber)
-    if (-not $LineNumber) { return 'File-level issue (no line)' }
+    
+    if (-not $LineNumber) {
+        Write-Warn "No line number for component: $ComponentKey → File-level issue"
+        return 'File-level issue (no line number in SonarQube)'
+    }
 
     $uri = "$ServerUrl/api/sources/raw?key=$ComponentKey"
     try {
@@ -79,6 +83,8 @@ function Get-CodeSnippet {
         $bytes = $resp.Content.ReadAsByteArrayAsync().Result
         $source = [Text.Encoding]::UTF8.GetString($bytes)
         $lines = $source -split "`n" | Where-Object { $_ -ne '' }
+
+        if ($lines.Count -eq 0) { return 'Empty source file' }
 
         $start = [Math]::Max(1, $LineNumber - $SnippetLinesBefore)
         $end   = [Math]::Min($lines.Count, $LineNumber + $SnippetLinesAfter)
@@ -89,7 +95,8 @@ function Get-CodeSnippet {
         return $snippet -join "`n"
     }
     catch {
-        return "Snippet error: $($_.Exception.Message)"
+        Write-Warn "Failed to fetch source for $ComponentKey (Line $LineNumber): $($_.Exception.Message)"
+        return "Source unavailable (404 / permission / deleted)"
     }
 }
 
