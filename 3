@@ -1,5 +1,3 @@
-# Replace entire script with this:
-
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$ServerUrl,
@@ -8,49 +6,49 @@ param(
     [Parameter(Mandatory)][string]$OutputPath,
     [int]$SnippetLinesBefore = 5,
     [int]$SnippetLinesAfter = 5,
-    [int]$PageSize = 100,
+    [int]$PageSize = 500,  # Max for 2025.4.2
     [switch]$IncludeResolved,
     [switch]$IncludeCWE
 )
 
-function Write-Info   { param([string]$m) Write-Host "[INFO]  $m" -ForegroundColor Cyan }
-function Write-Warn   { param([string]$m) Write-Host "[WARN]  $m" -ForegroundColor Yellow }
-function Write-Error  { param([string]$m) Write-Host "[ERROR] $m" -ForegroundColor Red }
+function Write-Info { param([string]$m) Write-Host "[INFO] $m" -ForegroundColor Cyan }
+function Write-Warn { param([string]$m) Write-Host "[WARN] $m" -ForegroundColor Yellow }
+function Write-Error { param([string]$m) Write-Host "[ERROR] $m" -ForegroundColor Red }
 
 $headers = @{ Authorization = "Basic $([Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Token")))"; Accept = 'application/json' }
 $ProgressPreference = 'SilentlyContinue'
 
-# 1. Verify
+# Verify Connection
 $testUri = "$ServerUrl/api/system/status"
 try { $status = Invoke-RestMethod -Uri $testUri -Headers $headers -SkipCertificateCheck -ErrorAction Stop; Write-Info "Connected to $($status.version)" }
 catch { Write-Error "Connection failed: $($_.Exception.Message)"; return }
 
-# 2. Rule details
+# Rule Details
 function Get-RuleDetails { param([string]$RuleKey)
     $uri = "$ServerUrl/api/rules/show?key=$RuleKey&actives_only=true"
     try {
         $r = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
         $desc = ($r.rule.htmlDesc -replace '<[^>]+>', '' -replace "`r`n","`n").Trim()
         return @{ Recommendation = ($desc -split "`n" | Where-Object {$_} | ForEach-Object Trim) -join ' '; Effort = $r.rule.remedialEffort ?? 'Unknown'; CWE = ($IncludeCWE -and $r.rule.cwe) ? ($r.rule.cwe -join ', ') : '' }
-    } catch { Write-Warn "Rule $RuleKey failed: $($_.Exception.Message)"; return @{ Recommendation = 'N/A'; Effort = 'Unknown'; CWE = '' } }
+    } catch { Write-Warn "Rule $RuleKey failed"; return @{ Recommendation = 'N/A'; Effort = 'Unknown'; CWE = '' } }
 }
 
-# 3. Code snippet
+# Code Snippet
 function Get-CodeSnippet { param([string]$ComponentKey, [int]$LineNumber)
-    if (-not $LineNumber) { Write-Warn "File-level: $ComponentKey"; return 'File-level issue' }
+    if (-not $LineNumber) { Write-Warn "File-level: $ComponentKey"; return 'File-level issue (review full source)' }
     $uri = "$ServerUrl/api/sources/raw?key=$ComponentKey"
     try {
-        $resp = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
-        $lines = ($resp -split "`n" | Where-Object { $_ -ne '' })
+        $source = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
+        $lines = ($source -split "`n" | Where-Object { $_ -ne '' })
         if ($lines.Count -eq 0) { return 'Empty file' }
         $start = [Math]::Max(1, $LineNumber - $SnippetLinesBefore)
         $end = [Math]::Min($lines.Count, $LineNumber + $SnippetLinesAfter)
         $snippet = for ($i = $start-1; $i -lt $end; $i++) { "Line $($i+1): $($lines[$i])" }
         return $snippet -join "`n"
-    } catch { Write-Warn "Snippet failed: $ComponentKey (Line $LineNumber) - $($_.Exception.Message)"; return 'Source unavailable' }
+    } catch { Write-Warn "Snippet failed: $ComponentKey (Line $LineNumber)"; return 'Source unavailable (check perms)' }
 }
 
-# 4. Fetch ALL issues
+# Fetch All Issues
 $allIssues = @()
 $page = 1
 do {
@@ -71,11 +69,11 @@ do {
 } while ($allIssues.Count -lt $resp.paging.total -and $issues.Count -gt 0)
 
 if ($allIssues.Count -eq 0) {
-    Write-Warn "No issues found. Check scan logs or add test vulnerabilities."
+    Write-Warn "No issues found in SonarQube. Verify scan in UI (Projects > Issues) or re-scan TFS folders with ABAP plugin."
     return
 }
 
-# 5. Export
+# Export
 $export = foreach ($i in $allIssues) {
     $rule = Get-RuleDetails -RuleKey $i.rule
     $snippet = Get-CodeSnippet -ComponentKey $i.component -LineNumber $i.line
@@ -94,8 +92,7 @@ $export = foreach ($i in $allIssues) {
     }
 }
 
-# 6. Save
 $export | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-Write-Info "Exported $($export.Count) issues to $OutputPath"
-Write-Info "Sample:"
-$export | Select-Object -First 1 | Format-List
+Write-Info "Exported $($export.Count) issues to $OutputPath for government report merge"
+Write-Info "Sample (High/CRITICAL):"
+$export | Where-Object Severity -in 'CRITICAL','HIGH' | Select-Object -First 1 | Format-List
