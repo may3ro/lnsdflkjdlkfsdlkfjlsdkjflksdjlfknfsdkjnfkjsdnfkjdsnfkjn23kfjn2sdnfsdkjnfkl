@@ -1,140 +1,173 @@
 # ===========================================
 # SonarQube ABAP Security Export (PS 7.5.4)
-# Project: abap-all-test3  |  Issues + Snippets
+# Project: abap-all-test3 | Vulnerabilities + Snippets
+# Method: components/tree (files) -> issues/search (componentKeys)
 # ===========================================
 
 # -------- CONFIG --------
-$Base        = 'http://localhost:9000'          # your SonarQube base URL (no trailing /)
-$UserToken   = '<YOUR_USER_TOKEN>'              # user token with Browse + See Source Code
-$ProjectKey  = 'abap-all-test3'                 # real project key
-$Branch      = ''                               # e.g. 'main' or '' if not used
-$PullRequest = ''                               # e.g. '123' or '' if not used
+$Base        = 'http://localhost:9000'           # SonarQube base
+$UserToken   = '<YOUR_USER_TOKEN>'               # user token with Browse + See Source Code
+$ProjectKey  = 'abap-all-test3'                  # real project key
+$Branch      = ''                                 # e.g. 'main' or '' if not used
+$PullRequest = ''                                 # e.g. '123' or '' if not PR
 $OutCsv      = 'SQ_Vulnerabilities_abap-all-test3.csv'
+$BatchSize   = 100                                # componentKeys per call (safe chunk)
 
 # -------- AUTH HEADER (safe) --------
-$pair  = $UserToken + ':'                       # no "$Var:" interpolation
+$pair  = $UserToken + ':'
 $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
 $H     = @{ Authorization = "Basic $basic" }
 
-# -------- SANITY CHECKS --------
+# -------- QUICK SANITY --------
 $ver = Invoke-RestMethod -Uri "$Base/api/server/version" -Headers $H -ErrorAction Stop
-Write-Host "SonarQube server version: $ver"
-
-# Prove issues endpoint works without filter
-$null = Invoke-RestMethod -Uri "$Base/api/issues/search?p=1&ps=1" -Headers $H -ErrorAction Stop
-
-# -------- PICK THE RIGHT PROJECT FILTER PARAM --------
-$IssuesEndpoint = "$Base/api/issues/search"
-$workingParam = $null
-
-# try 'projects' first (most common on 2025.x), then 'components'
-foreach ($p in @('projects','components')) {
-    $u = "$IssuesEndpoint?${p}=$([uri]::EscapeDataString($ProjectKey))&types=VULNERABILITY&p=1&ps=1"
-    if ($Branch)      { $u += "&branch=$([uri]::EscapeDataString($Branch))" }
-    if ($PullRequest) { $u += "&pullRequest=$([uri]::EscapeDataString($PullRequest))" }
-    try {
-        $r = Invoke-RestMethod -Uri $u -Headers $H -Method Get -ErrorAction Stop
-        if ($r -and $r.paging) { $workingParam = $p; break }
-    } catch { }
-}
-if (-not $workingParam) {
-    throw "Could not call /api/issues/search for project '$ProjectKey'. Open $Base/web_api → issues/search and check the exact param (projects/components)."
-}
-Write-Host "Using /api/issues/search with parameter '$workingParam'."
+Write-Host "SonarQube server: $ver"
 
 # -------- HELPERS --------
-function Strip-Html([string]$s) {
-    if (-not $s) { return '' }
-    (($s -replace '<[^>]+>', '') -replace '\s+', ' ').Trim()
+function GET([string]$u) {
+  Invoke-RestMethod -Uri $u -Headers $H -Method Get -ErrorAction Stop
 }
 
-function Get-AllVulnerabilities {
-    $all=@(); $page=1; $ps=500
-    do {
-        $u = "$IssuesEndpoint?${workingParam}=$([uri]::EscapeDataString($ProjectKey))&types=VULNERABILITY&p=$page&ps=$ps"
-        if ($Branch)      { $u += "&branch=$([uri]::EscapeDataString($Branch))" }
-        if ($PullRequest) { $u += "&pullRequest=$([uri]::EscapeDataString($PullRequest))" }
-        $resp = Invoke-RestMethod -Uri $u -Headers $H -Method Get -ErrorAction Stop
-        if ($resp.issues) { $all += $resp.issues }
-        $total = [int]$resp.paging.total
-        $page++
-    } while ($all.Count -lt $total)
-    $all
+function Strip-Html([string]$s) {
+  if (-not $s) { return '' }
+  (($s -replace '<[^>]+>', '') -replace '\s+', ' ').Trim()
 }
 
 function Get-Rule([string]$RuleKey) {
-    try {
-        $r = Invoke-RestMethod -Uri ("$Base/api/rules/show?key=$([uri]::EscapeDataString($RuleKey))") -Headers $H -Method Get -ErrorAction Stop
-        if ($r -and $r.rule) { return $r.rule } else { return $null }
-    } catch { return $null }
+  try {
+    $r = GET "$Base/api/rules/show?key=$([uri]::EscapeDataString($RuleKey))"
+    if ($r -and $r.rule) { $r.rule } else { $null }
+  } catch { $null }
 }
 
 function Get-SourceLines([string]$ComponentKey) {
-    # Try RAW first
-    $u = "$Base/api/sources/raw?key=$([uri]::EscapeDataString($ComponentKey))"
-    if ($Branch)      { $u += "&branch=$([uri]::EscapeDataString($Branch))" }
-    if ($PullRequest) { $u += "&pullRequest=$([uri]::EscapeDataString($PullRequest))" }
-    try {
-        $raw = Invoke-RestMethod -Uri $u -Headers $H -Method Get -ErrorAction Stop
-        if ($raw) { return ($raw -split "`n") }
-    } catch { }
-
-    # Fallback: SHOW (JSON)
-    $u2 = "$Base/api/sources/show?key=$([uri]::EscapeDataString($ComponentKey))"
-    if ($Branch)      { $u2 += "&branch=$([uri]::EscapeDataString($Branch))" }
-    if ($PullRequest) { $u2 += "&pullRequest=$([uri]::EscapeDataString($PullRequest))" }
-    try {
-        $show = Invoke-RestMethod -Uri $u2 -Headers $H -Method Get -ErrorAction Stop
-        if ($show -and $show.sources) { return @($show.sources | ForEach-Object { $_.code }) }
-    } catch { }
-    return $null
+  # Try RAW first
+  $u = "$Base/api/sources/raw?key=$([uri]::EscapeDataString($ComponentKey))"
+  if ($Branch)      { $u += "&branch=$([uri]::EscapeDataString($Branch))" }
+  if ($PullRequest) { $u += "&pullRequest=$([uri]::EscapeDataString($PullRequest))" }
+  try {
+    $raw = GET $u
+    if ($raw) { return ($raw -split "`n") }
+  } catch { }
+  # Fallback: SHOW (JSON)
+  $u2 = "$Base/api/sources/show?key=$([uri]::EscapeDataString($ComponentKey))"
+  if ($Branch)      { $u2 += "&branch=$([uri]::EscapeDataString($Branch))" }
+  if ($PullRequest) { $u2 += "&pullRequest=$([uri]::EscapeDataString($PullRequest))" }
+  try {
+    $show = GET $u2
+    if ($show -and $show.sources) { return @($show.sources | ForEach-Object { $_.code }) }
+  } catch { }
+  $null
 }
 
-function Get-Snippet([string]$ComponentKey, [int]$Line) {
-    if (-not $Line -or $Line -le 0) { return '' }
-    $lines = Get-SourceLines $ComponentKey
-    if (-not $lines) { return '' }
-    $start = [Math]::Max(1, $Line - 3)
-    $end   = [Math]::Min($lines.Length, $Line + 3)
-    ($start..$end | ForEach-Object { '{0,4}: {1}' -f $_, $lines[$_-1] }) -join "`n"
+function Snippet([string]$ComponentKey, [int]$Line) {
+  if (-not $Line -or $Line -le 0) { return '' }
+  $lines = Get-SourceLines $ComponentKey
+  if (-not $lines) { return '' }
+  $start = [Math]::Max(1, $Line - 3)
+  $end   = [Math]::Min($lines.Length, $Line + 3)
+  ($start..$end | ForEach-Object { '{0,4}: {1}' -f $_, $lines[$_-1] }) -join "`n"
 }
 
-# -------- FETCH + ENRICH + EXPORT --------
-$issues = Get-AllVulnerabilities
-Write-Host ("Vulnerabilities returned: {0}" -f $issues.Count)
+# -------- 1) Enumerate ALL file components under the project --------
+Write-Host "Collecting file components for project '$ProjectKey'..."
+$files = @()
+$p = 1; $ps = 500
+do {
+  $u = "$Base/api/components/tree?component=$([uri]::EscapeDataString($ProjectKey))&qualifiers=FIL&p=$p&ps=$ps"
+  if ($Branch)      { $u += "&branch=$([uri]::EscapeDataString($Branch))" }
+  if ($PullRequest) { $u += "&pullRequest=$([uri]::EscapeDataString($PullRequest))" }
+  $r = GET $u
+  if ($r.components) { $files += $r.components }
+  $p++
+} while ($r.components -and $r.components.Count -eq $ps)
 
-$rows = foreach ($i in $issues) {
-    # line can be in .line or .textRange.startLine
-    $line = if ($i.line) { [int]$i.line } elseif ($i.textRange -and $i.textRange.startLine) { [int]$i.textRange.startLine } else { $null }
+if ($files.Count -eq 0) {
+  throw "No file components found under project '$ProjectKey'. Verify the key and that analysis produced file components."
+}
+Write-Host ("Files discovered: {0}" -f $files.Count)
 
-    $rule = Get-Rule $i.rule
-    $ruleName = if ($rule -and $rule.name) { $rule.name } else { $i.rule }
-    $descHtml = if ($rule -and $rule.htmlDesc) { $rule.htmlDesc } elseif ($rule -and $rule.mdDesc) { $rule.mdDesc } else { '' }
-    $desc     = Strip-Html $descHtml
-    $reco     = if ($rule -and $rule.remediation) {
-                   Strip-Html ( (($rule.remediation.func) ? $rule.remediation.func : '') + ' ' +
-                                (($rule.remediation.gapDescription) ? $rule.remediation.gapDescription : '') )
-                } elseif ($rule -and $rule.debtRemFnBaseEffort) {
-                   Strip-Html $rule.debtRemFnBaseEffort
-                } else {
-                   $desc
-                }
+# -------- 2) Pull vulnerabilities by file batches via componentKeys --------
+Write-Host "Fetching vulnerabilities (types=VULNERABILITY) across files..."
+$issues = @()
+for ($i = 0; $i -lt $files.Count; $i += $BatchSize) {
+  $slice = $files[$i..([Math]::Min($i + $BatchSize - 1, $files.Count - 1))]
+  $keys  = ($slice | ForEach-Object { $_.key }) -join ','
+  $u = "$Base/api/issues/search?componentKeys=$([uri]::EscapeDataString($keys))&types=VULNERABILITY&p=1&ps=500"
+  if ($Branch)      { $u += "&branch=$([uri]::EscapeDataString($Branch))" }
+  if ($PullRequest) { $u += "&pullRequest=$([uri]::EscapeDataString($PullRequest))" }
 
-    [pscustomobject]@{
-        Project        = $ProjectKey
-        Branch         = ($Branch -ne '' ? $Branch : 'main')
-        File           = $i.component
-        Line           = $line
-        Severity       = $i.severity
-        Type           = $i.type
-        RuleKey        = $i.rule
-        RuleName       = $ruleName
-        Message        = $i.message
-        Description    = $desc
-        Recommendation = $reco
-        CodeSnippet    = (Get-Snippet $i.component $line)
+  # Paginate inside the batch (if needed)
+  $page = 1
+  do {
+    $uPage = $u -replace 'p=1', ("p={0}" -f $page)
+    try {
+      $resp = GET $uPage
+    } catch {
+      Write-Warning "Issues call failed for batch starting at index $i (URL too long or other error). Splitting to smaller batch..."
+      # Retry with smaller batch when URL too long (IIS/nginx limits). Split slice into halves.
+      if ($slice.Count -gt 1) {
+        $half = [Math]::Floor($slice.Count / 2)
+        for ($j = 0; $j -lt $slice.Count; $j += $half) {
+          $sub = $slice[$j..([Math]::Min($j + $half - 1, $slice.Count - 1))]
+          $subkeys = ($sub | ForEach-Object { $_.key }) -join ','
+          $uSub = "$Base/api/issues/search?componentKeys=$([uri]::EscapeDataString($subkeys))&types=VULNERABILITY&p=1&ps=500"
+          if ($Branch)      { $uSub += "&branch=$([uri]::EscapeDataString($Branch))" }
+          if ($PullRequest) { $uSub += "&pullRequest=$([uri]::EscapeDataString($PullRequest))" }
+          $page2 = 1
+          do {
+            $r2 = GET ($uSub -replace 'p=1', ("p={0}" -f $page2))
+            if ($r2.issues) { $issues += $r2.issues }
+            $tot2 = [int]$r2.paging.total
+            $pgCount2 = [math]::Ceiling($tot2 / 500)
+            $page2++
+          } while ($page2 -le $pgCount2)
+        }
+      }
+      break
     }
+
+    if ($resp.issues) { $issues += $resp.issues }
+    $total   = [int]$resp.paging.total
+    $pgCount = [math]::Ceiling($total / 500)
+    $page++
+  } while ($page -le $pgCount)
+}
+Write-Host ("Vulnerabilities collected: {0}" -f $issues.Count)
+
+# -------- 3) Enrich with rule text + code snippets --------
+Write-Host "Enriching with rule details and source snippets..."
+$rows = foreach ($i in $issues) {
+  $line = if ($i.line) { [int]$i.line } elseif ($i.textRange -and $i.textRange.startLine) { [int]$i.textRange.startLine } else { $null }
+
+  $rule = Get-Rule $i.rule
+  $ruleName = if ($rule -and $rule.name) { $rule.name } else { $i.rule }
+  $descHtml = if ($rule -and $rule.htmlDesc) { $rule.htmlDesc } elseif ($rule -and $rule.mdDesc) { $rule.mdDesc } else { '' }
+  $desc     = Strip-Html $descHtml
+  $reco     = if ($rule -and $rule.remediation) {
+                Strip-Html ( (($rule.remediation.func) ? $rule.remediation.func : '') + ' ' +
+                             (($rule.remediation.gapDescription) ? $rule.remediation.gapDescription : '') )
+              } elseif ($rule -and $rule.debtRemFnBaseEffort) {
+                Strip-Html $rule.debtRemFnBaseEffort
+              } else {
+                $desc
+              }
+
+  [pscustomobject]@{
+    Project        = $ProjectKey
+    Branch         = ($Branch -ne '' ? $Branch : 'main')
+    File           = $i.component
+    Line           = $line
+    Severity       = $i.severity
+    Type           = $i.type
+    RuleKey        = $i.rule
+    RuleName       = $ruleName
+    Message        = $i.message
+    Description    = $desc
+    Recommendation = $reco
+    CodeSnippet    = (Snippet $i.component $line)
+  }
 }
 
+# -------- 4) Export --------
 $rows | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8
 Write-Host "Export complete: $OutCsv"
