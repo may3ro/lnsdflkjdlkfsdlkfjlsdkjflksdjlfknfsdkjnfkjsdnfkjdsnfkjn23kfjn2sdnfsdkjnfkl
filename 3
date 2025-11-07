@@ -1,116 +1,165 @@
-[CmdletBinding()]
-param(
-    [Parameter(Mandatory)][string]$ServerUrl,
-    [Parameter(Mandatory)][string]$Token,
-    [Parameter(Mandatory)][string]$ProjectKey,
-    [Parameter(Mandatory)][string]$OutputPath,
-    [int]$SnippetLinesBefore = 5,
-    [int]$SnippetLinesAfter = 5,
-    [int]$PageSize = 500
-)
+# =============================
+# SonarQube ABAP Export (PS 7.5)
+# - Finds correct issues param automatically
+# - Gets Vulnerabilities; optional Hotspots
+# - Adds ±3-line source snippet
+# =============================
 
-function Write-Info { param([string]$m) Write-Host "[INFO] $m" -ForegroundColor Cyan }
-function Write-Warn { param([string]$m) Write-Host "[WARN] $m" -ForegroundColor Yellow }
-function Write-Error { param([string]$m) Write-Host "[ERROR] $m" -ForegroundColor Red }
+# ---- CONFIG ----
+$Base        = 'http://localhost:9000'
+$UserToken   = '<YOUR_USER_TOKEN>'   # user token with Browse + See Source Code
+$ProjectKey  = 'abap-all-test3'      # EXACT project key you see in the UI
+$Branch      = 'main'                # '' if not needed
+$PullRequest = ''                    # '' if not PR
+$OutCsv      = 'SQ_Vulnerabilities.csv'
+$OutHotspots = 'SQ_Hotspots.csv'     # optional
+$AlsoHotspots = $false               # set $true to export hotspots as well
 
-$headers = @{ Authorization = "Basic $([Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Token")))"; Accept = 'application/json' }
-$ProgressPreference = 'SilentlyContinue'
+# ---- AUTH HEADER (safe) ----
+$pair   = $UserToken + ':'
+$basic  = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+$H      = @{ Authorization = "Basic $basic" }
 
-# Verify
-$testUri = "$ServerUrl/api/system/status"
-try { $status = Invoke-RestMethod -Uri $testUri -Headers $headers -SkipCertificateCheck -ErrorAction Stop; Write-Info "Connected to $($status.version)" }
-catch { Write-Error "Connection failed: $($_.Exception.Message)"; return }
+# ---- QUICK SANITY ----
+$ver = Invoke-RestMethod -Uri "$Base/api/server/version" -Headers $H -ErrorAction Stop
+Write-Host "SonarQube server version: $ver"
 
-# Rule Details
-function Get-RuleDetails { param([string]$RuleKey)
-    $uri = "$ServerUrl/api/rules/show?key=$RuleKey&actives_only=true"
+# ---- TRY ISSUES PARAM NAMES UNTIL ONE WORKS ----
+$IssuesEndpoint = "$Base/api/issues/search"
+$paramCandidates = @('projects','project','components','component','componentKeys','projectKeys')
+$workingParam = $null
+foreach ($p in $paramCandidates) {
+    $u = "$IssuesEndpoint?${p}=$([uri]::EscapeDataString($ProjectKey))&types=VULNERABILITY&p=1&ps=1"
+    if ($Branch)      { $u += "&branch=$([uri]::EscapeDataString($Branch))" }
+    if ($PullRequest) { $u += "&pullRequest=$([uri]::EscapeDataString($PullRequest))" }
     try {
-        $r = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
-        $desc = ($r.rule.htmlDesc -replace '<[^>]+>', '' -replace "`r`n","`n").Trim()
-        return @{ Recommendation = ($desc -split "`n" | Where-Object {$_} | ForEach-Object Trim) -join ' '; Effort = $r.rule.remedialEffort ?? 'Unknown'; CWE = $r.rule.cwe ? ($r.rule.cwe -join ', ') : '' }
-    } catch { Write-Warn "Rule $RuleKey failed"; return @{ Recommendation = 'N/A'; Effort = 'Unknown'; CWE = '' } }
+        $r = Invoke-RestMethod -Uri $u -Headers $H -Method Get -ErrorAction Stop
+        if ($r -and $r.paging) { $workingParam = $p; break }
+    } catch { }
+}
+if (-not $workingParam) {
+    throw "Could not find a working parameter for /api/issues/search. Open $Base/web_api → issues/search and note the exact key to filter by project/component."
+}
+Write-Host "Using /api/issues/search with parameter '$workingParam'."
+
+# ---- HELPERS ----
+function Get-AllIssues {
+    param([string]$Endpoint, [string]$ParamName, [string]$Proj, [string]$Branch, [string]$PR)
+    $all=@(); $page=1; $ps=500
+    do {
+        $u = "$Endpoint?${ParamName}=$([uri]::EscapeDataString($Proj))&types=VULNERABILITY&p=$page&ps=$ps"
+        if ($Branch) { $u += "&branch=$([uri]::EscapeDataString($Branch))" }
+        if ($PR)     { $u += "&pullRequest=$([uri]::EscapeDataString($PR))" }
+        $resp = Invoke-RestMethod -Uri $u -Headers $H -Method Get -ErrorAction Stop
+        if ($resp.issues) { $all += $resp.issues }
+        $total = [int]$resp.paging.total
+        $page++
+    } while ($all.Count -lt $total)
+    $all
 }
 
-# Code Snippet
-function Get-CodeSnippet { param([string]$ComponentKey, [int]$LineNumber)
-    if (-not $LineNumber) { Write-Warn "File-level hotspot: $ComponentKey"; return 'File-level security hotspot: Review full source for risks like CWE-284 (auth bypass, SAP Note 2800347)' }
-    $uri = "$ServerUrl/api/sources/raw?key=$ComponentKey"
-    try {
-        $source = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
-        $lines = ($source -split "`n" | Where-Object { $_ -ne '' })
-        if ($lines.Count -eq 0) { return 'Empty file' }
-        $start = [Math]::Max(1, $LineNumber - $SnippetLinesBefore)
-        $end = [Math]::Min($lines.Count, $LineNumber + $SnippetLinesAfter)
-        $snippet = for ($i = $start-1; $i -lt $end; $i++) { "Line $($i+1): $($lines[$i])" }
-        return $snippet -join "`n"
-    } catch { Write-Warn "Snippet failed: $ComponentKey (Line $LineNumber)"; return 'Source unavailable (check "See Source Code" perm)' }
+function Strip-Html([string]$s) {
+    if (-not $s) { return '' }
+    (($s -replace '<[^>]+>', '') -replace '\s+', ' ').Trim()
 }
 
-# Fetch Vulnerabilities (/api/issues/search)
-$allVulns = @()
-$page = 1
-do {
-    $params = @{ componentKeys = $ProjectKey; types = 'VULNERABILITY'; ps = $PageSize; p = $page }
-    $uri = "$ServerUrl/api/issues/search?" + ($params.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '&'
-    Write-Info "Fetching Vulns page ${page}..."
+function Get-Rule([string]$key) {
     try {
-        $resp = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
-        Write-Info "Raw Vulns: total=$($resp.paging.total), page=$($resp.paging.pageIndex)/$($resp.paging.pages)"
-        $allVulns += $resp.issues
-        $page++
-    } catch { Write-Error "Vulns API failed on page ${page}: $($_.Exception.Message)"; break }
-} while ($allVulns.Count -lt $resp.paging.total -and $resp.issues.Count -gt 0)
+        $r = Invoke-RestMethod -Uri ("$Base/api/rules/show?key=$([uri]::EscapeDataString($key))") -Headers $H -Method Get -ErrorAction Stop
+        if ($r -and $r.rule) { return $r.rule } else { return $null }
+    } catch { return $null }
+}
 
-# Fetch Hotspots (/api/hotspots/search)
-$allHotspots = @()
-$page = 1
-do {
-    $params = @{ projectKey = $ProjectKey; ps = $PageSize; p = $page }
-    $uri = "$ServerUrl/api/hotspots/search?" + ($params.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '&'
-    Write-Info "Fetching Hotspots page ${page}..."
+function Get-SourceLines([string]$component) {
+    # Try raw first (faster)
+    $u = "$Base/api/sources/raw?key=$([uri]::EscapeDataString($component))"
+    if ($Branch)      { $u += "&branch=$([uri]::EscapeDataString($Branch))" }
+    if ($PullRequest) { $u += "&pullRequest=$([uri]::EscapeDataString($PullRequest))" }
     try {
-        $resp = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
-        Write-Info "Raw Hotspots: total=$($resp.paging.total), page=$($resp.paging.pageIndex)/$($resp.paging.pages)"
-        $allHotspots += $resp.hotspots
-        $page++
-    } catch { Write-Error "Hotspots API failed on page ${page}: $($_.Exception.Message)"; break }
-} while ($allHotspots.Count -lt $resp.paging.total -and $resp.hotspots.Count -gt 0)
+        $raw = Invoke-RestMethod -Uri $u -Headers $H -Method Get -ErrorAction Stop
+        if ($raw) { return ($raw -split "`n") }
+    } catch {}
+    # Fallback to /show
+    $u2 = "$Base/api/sources/show?key=$([uri]::EscapeDataString($component))"
+    if ($Branch)      { $u2 += "&branch=$([uri]::EscapeDataString($Branch))" }
+    if ($PullRequest) { $u2 += "&pullRequest=$([uri]::EscapeDataString($PullRequest))" }
+    try {
+        $show = Invoke-RestMethod -Uri $u2 -Headers $H -Method Get -ErrorAction Stop
+        if ($show -and $show.sources) { return @($show.sources | ForEach-Object { $_.code }) }
+    } catch {}
+    return $null
+}
 
-# Combine (Vulns + Hotspots, normalize fields)
-$allSecurity = $allVulns + $allHotspots | ForEach-Object {
-    $item = $_
-    [PSCustomObject]@{
-        rule = $item.rule ?? $item.ruleKey
-        severity = $item.severity
-        type = $item.type ?? 'SECURITY_HOTSPOT'
-        component = $item.component ?? $item.componentKey
-        line = $item.line
-        message = $item.message
+function Snippet([string]$component, [int]$line) {
+    if (-not $line -or $line -le 0) { return '' }
+    $lines = Get-SourceLines $component
+    if (-not $lines) { return '' }
+    $start = [Math]::Max(1, $line - 3)
+    $end   = [Math]::Min($lines.Length, $line + 3)
+    ($start..$end | ForEach-Object { '{0,4}: {1}' -f $_, $lines[$_-1] }) -join "`n"
+}
+
+# ---- FETCH VULNERABILITIES ----
+$issues = Get-AllIssues -Endpoint $IssuesEndpoint -ParamName $workingParam -Proj $ProjectKey -Branch $Branch -PR $PullRequest
+Write-Host ("Vulnerabilities returned: {0}" -f $issues.Count)
+
+# Enrich (rules + snippets)
+$rows = foreach ($i in $issues) {
+    $line = if ($i.line) { [int]$i.line } elseif ($i.textRange.startLine) { [int]$i.textRange.startLine } else { $null }
+    $rule = Get-Rule $i.rule
+    $ruleName = if ($rule -and $rule.name) { $rule.name } else { $i.rule }
+    $descHtml = if ($rule -and $rule.htmlDesc) { $rule.htmlDesc } elseif ($rule -and $rule.mdDesc) { $rule.mdDesc } else { '' }
+    $desc     = Strip-Html $descHtml
+    $reco     = if ($rule -and $rule.remediation) {
+        Strip-Html ( ($rule.remediation.func ?? '') + ' ' + ($rule.remediation.gapDescription ?? '') )
+    } elseif ($rule -and $rule.debtRemFnBaseEffort) {
+        Strip-Html $rule.debtRemFnBaseEffort
+    } else { $desc }
+    [pscustomobject]@{
+        Project        = $ProjectKey
+        Branch         = ($Branch ? $Branch : 'main')
+        File           = $i.component
+        Line           = $line
+        Severity       = $i.severity
+        Type           = $i.type
+        RuleKey        = $i.rule
+        RuleName       = $ruleName
+        Message        = $i.message
+        Description    = $desc
+        Recommendation = $reco
+        CodeSnippet    = (Snippet $i.component $line)
     }
 }
 
-if ($allSecurity.Count -eq 0) { Write-Warn "0 Security (Vulns + Hotspots). Confirm UI project key and token perms."; return }
+$rows | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8
+Write-Host "Vulnerabilities export complete: $OutCsv"
 
-# Export
-$export = foreach ($i in $allSecurity) {
-    $rule = Get-RuleDetails -RuleKey $i.rule
-    $snippet = Get-CodeSnippet -ComponentKey $i.component -LineNumber $i.line
-    $file = ($i.component -replace "^$ProjectKey`:", '').Split('/')[-1]
-    [PSCustomObject]@{
-        'Rule ID'        = $i.rule
-        'Severity'       = $i.severity
-        'Type'           = $i.type
-        'ABAP File'      = $file
-        'Line'           = $i.line
-        'Message'        = $i.message
-        'Recommendation' = ($rule.Recommendation.Substring(0, [Math]::Min(500, $rule.Recommendation.Length))) + '...'
-        'Effort'         = $rule.Effort
-        'CWE'            = $rule.CWE
-        'Code Snippet'   = ($snippet.Substring(0, [Math]::Min(2000, $snippet.Length))) + '...'
+# ---- (OPTIONAL) SECURITY HOTSPOTS ----
+if ($AlsoHotspots) {
+    # Hotspots live under another API
+    $hsAll=@(); $page=1; $ps=500
+    do {
+        $u = "$Base/api/hotspots/search?projectKey=$([uri]::EscapeDataString($ProjectKey))&p=$page&ps=$ps"
+        if ($Branch) { $u += "&branch=$([uri]::EscapeDataString($Branch))" }
+        $r = Invoke-RestMethod -Uri $u -Headers $H -Method Get -ErrorAction Stop
+        if ($r.hotspots) { $hsAll += $r.hotspots }
+        $total = [int]$r.paging.total
+        $page++
+    } while ($hsAll.Count -lt $total)
+
+    $hsRows = foreach ($h in $hsAll) {
+        $snip = Snippet $h.component $h.line
+        [pscustomobject]@{
+            Project      = $ProjectKey
+            Branch       = ($Branch ? $Branch : 'main')
+            File         = $h.component
+            Line         = $h.line
+            VulnerabilityProbability = $h.vulnerabilityProbability
+            Status       = $h.status
+            Message      = $h.message
+            CodeSnippet  = $snip
+        }
     }
+    $hsRows | Export-Csv -Path $OutHotspots -NoTypeInformation -Encoding UTF8
+    Write-Host "Hotspots export complete: $OutHotspots"
 }
-
-$export | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-Write-Info "Exported $($export.Count) Security issues (Vulns + Hotspots) to $OutputPath"
-Write-Info "Sample CRITICAL/HIGH:"
-$export | Where-Object Severity -in 'CRITICAL','HIGH' | Select-Object -First 1 | Format-List
