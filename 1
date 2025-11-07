@@ -1,25 +1,3 @@
-function Add-QS {
-    param([string]$url, [hashtable]$kv)
-    $pairs = foreach ($k in $kv.Keys) {
-        if ($null -ne $kv[$k] -and $kv[$k] -ne '') {
-            '{0}={1}' -f [uri]::EscapeDataString($k), [uri]::EscapeDataString([string]$kv[$k])
-        }
-    }
-    if (-not $pairs -or $pairs.Count -eq 0) { return $url }
-
-    if ($url.Contains('?')) { "$url&$($pairs -join '&')" }
-    else                    { "$url?$($pairs -join '&')" }
-}
-
-
-
-$Base       = 'http://localhost:9000'
-$Endpoint   = '/api/issues/search'
-$ProjectKey = 'abap-all-test3'
-$Branch     = 'main'     # or '' if not needed
-
-$u = Add-QS "$Base$Endpoint" @{ components=$ProjectKey; p=1; ps=10; branch=$Branch }
-$u
-irm $u -Headers $H | Select-Object -ExpandProperty paging
-
-
+$k='abap:SXXXX'   # put a real key from your CSV
+irm "$Base/api/rules/show?key=$([uri]::EscapeDataString($k))" -Headers $H | ConvertTo-Json -Depth 6
+irm "$Base/api/rules/search?rule_key=$([uri]::EscapeDataString($k))" -Headers $H | ConvertTo-Json -Depth 6
