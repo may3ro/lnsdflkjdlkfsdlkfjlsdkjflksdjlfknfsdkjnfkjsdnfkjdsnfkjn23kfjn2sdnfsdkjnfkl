@@ -1,2 +1,257 @@
-$k='abap:S5117'
-irm "$Base/api/rules/show?key=$([uri]::EscapeDataString($k))" -Headers $H | ConvertTo-Json -Depth 6
+# ============================================================
+# SonarQube ABAP Security Export (PS 7.5.4, SQ 2025.x)
+# Project: abap-all-test3
+# Output: Vulnerabilities + Why/How (descriptionSections-aware) + ±3-line Snippets
+# ============================================================
+
+# ---------------- CONFIG ----------------
+$Base        = 'http://localhost:9000'      # SonarQube base URL
+$UserToken   = '<YOUR_USER_TOKEN>'          # Must have "Browse" + "See Source Code"
+$ProjectKey  = 'abap-all-test3'
+$Branch      = ''                           # 'main' or leave blank
+$PullRequest = ''                           # leave blank if not PR
+$OutCsv      = 'SQ_Vulnerabilities_abap-all-test3.csv'
+$BatchSize   = 100
+$SortMode    = 'SeverityThenFile'           # or 'FileThenSeverity'
+
+# ---------------- AUTH HEADER ----------------
+$pair  = $UserToken + ':'
+$basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+$H     = @{ Authorization = "Basic $basic" }
+
+# ---------------- GENERIC HELPERS ----------------
+function GET([string]$u) {
+  Invoke-RestMethod -Uri $u -Headers $H -Method Get -ErrorAction Stop
+}
+
+function Strip-Html([string]$s) {
+  if (-not $s) { return '' }
+  (($s -replace '<[^>]+>', ' ') -replace '\s+', ' ').Trim()
+}
+
+function Severity-Rank {
+    param([string]$sev)
+    switch ($sev.ToUpperInvariant()) {
+        'BLOCKER'  { 0 }
+        'CRITICAL' { 1 }
+        'MAJOR'    { 2 }
+        'MINOR'    { 3 }
+        'INFO'     { 4 }
+        default    { 5 }
+    }
+}
+
+# ---------------- RULE FETCH (robust for 2025.x) ----------------
+# Returns a normalized hashtable:
+#  @{ Key; Name; HtmlAggregate; Sections (hashtable); RemediationTxt }
+function Get-RuleRich([string]$RuleKey) {
+  # Try /rules/show first
+  $rule = $null
+  try {
+    $r = GET ("$Base/api/rules/show?key={0}" -f [uri]::EscapeDataString($RuleKey))
+    if ($r -and $r.rule) { $rule = $r.rule }
+  } catch {}
+
+  if (-not $rule) {
+    # Fallback: /rules/search
+    try {
+      $s = GET ("$Base/api/rules/search?rule_key={0}" -f [uri]::EscapeDataString($RuleKey))
+      if ($s -and $s.rules -and $s.rules.Count -gt 0) { $rule = $s.rules[0] }
+    } catch {}
+  }
+
+  if (-not $rule) {
+    return @{
+      Key            = $RuleKey
+      Name           = $RuleKey
+      HtmlAggregate  = ''
+      Sections       = @{}
+      RemediationTxt = ''
+    }
+  }
+
+  # 1) Gather description text from all possible places
+  $htmlOrMdLegacy = $rule.htmlDesc ?? $rule.mdDesc ?? $rule.htmlDescription ?? $rule.markdownDescription ?? $rule.description ?? $rule.htmlNote ?? $rule.note
+
+  # 2) New 2025.x model: descriptionSections (array of { key, content (HTML) })
+  $sections = @{}
+  $aggregate = ''
+
+  if ($rule.descriptionSections) {
+    foreach ($sec in $rule.descriptionSections) {
+      $k = [string]$sec.key
+      $c = [string]$sec.content
+      if ($k) { $sections[$k] = $c }
+      if ($c) { $aggregate += "`n" + $c }
+    }
+  }
+
+  if (-not $aggregate -and $htmlOrMdLegacy) { $aggregate = $htmlOrMdLegacy }
+
+  # 3) Remediation text best-effort
+  $rem = ''
+  if ($rule.remediation) {
+    $rem = ((($rule.remediation.func) ? $rule.remediation.func : '') + ' ' +
+            (($rule.remediation.gapDescription) ? $rule.remediation.gapDescription : ''))
+  } elseif ($rule.debtRemFnBaseEffort) {
+    $rem = $rule.debtRemFnBaseEffort
+  }
+
+  @{
+    Key            = ($rule.key ?? $RuleKey)
+    Name           = ($rule.name ?? $RuleKey)
+    HtmlAggregate  = $aggregate       # HTML/MD combined
+    Sections       = $sections        # hashtable: key -> HTML
+    RemediationTxt = $rem
+  }
+}
+
+# ---------------- SOURCE + SNIPPETS ----------------
+function Get-SourceLines([string]$ComponentKey) {
+  $u = "$Base/api/sources/raw?key={0}" -f [uri]::EscapeDataString($ComponentKey)
+  if ($Branch)      { $u += "&branch={0}"      -f [uri]::EscapeDataString($Branch) }
+  if ($PullRequest) { $u += "&pullRequest={0}" -f [uri]::EscapeDataString($PullRequest) }
+  try {
+    $raw = GET $u
+    if ($raw) { return ($raw -split "`n") }
+  } catch {}
+
+  $u2 = "$Base/api/sources/show?key={0}" -f [uri]::EscapeDataString($ComponentKey)
+  if ($Branch)      { $u2 += "&branch={0}"      -f [uri]::EscapeDataString($Branch) }
+  if ($PullRequest) { $u2 += "&pullRequest={0}" -f [uri]::EscapeDataString($PullRequest) }
+  try {
+    $show = GET $u2
+    if ($show -and $show.sources) { return @($show.sources | ForEach-Object { $_.code }) }
+  } catch {}
+  $null
+}
+
+function Snippet([string]$ComponentKey, [int]$Line) {
+  if (-not $Line -or $Line -le 0) { return '' }
+  $lines = Get-SourceLines $ComponentKey
+  if (-not $lines) { return '' }
+  $start = [Math]::Max(1, $Line - 3)
+  $end   = [Math]::Min($lines.Length, $Line + 3)
+  ($start..$end | ForEach-Object { '{0,4}: {1}' -f $_, $lines[$_-1] }) -join "`n"
+}
+
+function Join-Encoded([string[]]$arr) {
+  if (-not $arr -or $arr.Count -eq 0) { return '' }
+  ($arr | ForEach-Object { [uri]::EscapeDataString($_) }) -join ','
+}
+
+# ---------------- FETCH COMPONENTS ----------------
+$ver = GET "$Base/api/server/version"
+Write-Host "SonarQube version: $ver"
+
+Write-Host "Collecting file components for project '$ProjectKey'..."
+$files=@(); $p=1; $ps=500
+do {
+  $u = "$Base/api/components/tree?component={0}&qualifiers=FIL&p={1}&ps={2}" -f [uri]::EscapeDataString($ProjectKey),$p,$ps
+  if ($Branch)      { $u += "&branch={0}"      -f [uri]::EscapeDataString($Branch) }
+  if ($PullRequest) { $u += "&pullRequest={0}" -f [uri]::EscapeDataString($PullRequest) }
+  $r = GET $u
+  if ($r.components) { $files += $r.components }
+  $p++
+} while ($r.components -and $r.components.Count -eq $ps)
+
+if ($files.Count -eq 0) { throw "No file components found under project '$ProjectKey'." }
+Write-Host ("Files discovered: {0}" -f $files.Count)
+
+# ---------------- FETCH ISSUES ----------------
+Write-Host "Fetching vulnerabilities (types=VULNERABILITY)..."
+$issues=@()
+for ($i=0; $i -lt $files.Count; $i+=$BatchSize) {
+  $slice=$files[$i..([Math]::Min($i+$BatchSize-1,$files.Count-1))]
+  $keysEnc = Join-Encoded ($slice | ForEach-Object { $_.key })
+  $baseUrl="$Base/api/issues/search?componentKeys=$keysEnc&types=VULNERABILITY&ps=500"
+  if ($Branch)      { $baseUrl+="&branch={0}"      -f [uri]::EscapeDataString($Branch) }
+  if ($PullRequest) { $baseUrl+="&pullRequest={0}" -f [uri]::EscapeDataString($PullRequest) }
+
+  $page=1
+  do {
+    $r=GET ($baseUrl+"&p=$page")
+    if ($r.issues) { $issues+=$r.issues }
+    $total=[int]$r.paging.total
+    $pages=[math]::Ceiling($total/500)
+    $page++
+  } while ($page -le $pages)
+}
+Write-Host ("Vulnerabilities collected: {0}" -f $issues.Count)
+
+# ---------------- ENRICHMENT (descriptionSections-aware) ----------------
+Write-Host "Enriching rules and snippets ..."
+$rows=foreach($i in $issues){
+  # normalize line
+  $line=$null
+  if($i.line){$line=[int]$i.line}elseif($i.textRange -and $i.textRange.startLine){$line=[int]$i.textRange.startLine}
+
+  $ruleRich=Get-RuleRich $i.rule
+  $ruleName=$ruleRich.Name
+
+  # Extract "Why" and "How" from descriptionSections where possible
+  $why=''; $how=''
+
+  if ($ruleRich.Sections.Count -gt 0) {
+    # “Why is this an issue?” → descriptionSections.key == 'root_cause' (per your example)
+    if ($ruleRich.Sections.ContainsKey('root_cause')) {
+      $why = Strip-Html $ruleRich.Sections['root_cause']
+    }
+
+    # “How to fix it” → prefer 'Compliant solution' (some payloads use h3 headings inside content)
+    # Try a few likely keys in order of usefulness
+    foreach ($k in @('how_to_fix','recommended_resolution','compliant_solution','solution','fix','mitigation')) {
+      if (-not $how -and $ruleRich.Sections.ContainsKey($k)) {
+        $how = Strip-Html $ruleRich.Sections[$k]
+      }
+    }
+
+    # If still empty, try to heuristically extract “Compliant solution” or similar from the aggregate HTML
+    if (-not $how -and $ruleRich.HtmlAggregate) {
+      $agg = $ruleRich.HtmlAggregate
+      # extract the block following <h3>Compliant solution</h3>
+      $m = [regex]::Match($agg, "(?is)<h3[^>]*>\s*Compliant\s+solution\s*</h3>\s*(?<body>.+?)(?:<h[23][^>]*>|\z)")
+      if ($m.Success) { $how = Strip-Html $m.Groups['body'].Value }
+    }
+  }
+
+  # Plain description (aggregate all text), and remediation (fallback for How/Recommendation)
+  $descPlain = if($ruleRich.HtmlAggregate){ Strip-Html $ruleRich.HtmlAggregate } else { '' }
+  $recoTxt   = if($ruleRich.RemediationTxt){ Strip-Html $ruleRich.RemediationTxt } else { '' }
+
+  if(-not $why){ $why = $descPlain }    # fallback
+  if(-not $how){ $how = $recoTxt }      # fallback
+  if(-not $recoTxt){ $recoTxt = $how }  # align when remediation missing
+
+  [pscustomobject]@{
+    Project        = $ProjectKey
+    Branch         = ($Branch -ne '' ? $Branch : 'main')
+    File           = $i.component
+    Line           = $line
+    Severity       = $i.severity
+    Type           = $i.type
+    RuleKey        = $i.rule
+    RuleName       = $ruleName
+    Message        = $i.message
+    WhyIssue       = $why
+    Description    = $descPlain
+    HowToFix       = $how
+    Recommendation = $recoTxt
+    CodeSnippet    = (Snippet $i.component $line)
+  }
+}
+
+# Warn if any rules returned no descriptive text (should drop a lot now)
+$noDesc = $rows | Where-Object { -not $_.Description -and -not $_.WhyIssue -and -not $_.HowToFix -and -not $_.Recommendation } |
+           Select-Object -ExpandProperty RuleKey -Unique
+if($noDesc){ Write-Warning ("Rules with no description returned by API: {0}" -f ($noDesc -join ', ')) }
+
+# ---------------- SORT + EXPORT ----------------
+if($SortMode -eq 'SeverityThenFile'){
+  $rows=$rows|Sort-Object @{e={Severity-Rank $_.Severity}},@{e='File'},@{e='Line'}
+}else{
+  $rows=$rows|Sort-Object @{e='File'},@{e='Line'},@{e={Severity-Rank $_.Severity}}
+}
+
+$rows|Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8
+Write-Host "Export complete: $OutCsv"
