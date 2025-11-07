@@ -1,13 +1,4 @@
-# 1) Build header (no interpolation before colon!)
-$UserToken = "<your_user_token>"
-$pair   = $UserToken + ":"
-$basic  = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
-$H      = @{ Authorization = "Basic $basic" }
-
-# 2) Validate token
-irm http://localhost:9000/api/authentication/validate -Headers $H
-
-# 3) Try issues endpoint (try these until one returns JSON with 'paging')
-irm "http://localhost:9000/api/issues/search?projectKeys=<your_project_key>&p=1&ps=1" -Headers $H
-irm "http://localhost:9000/api/issues/search?projects=<your_project_key>&p=1&ps=1"    -Headers $H
-irm "http://localhost:9000/api/issues/search?componentKeys=<your_project_key>&p=1&ps=1" -Headers $H
+irm "http://localhost:9000/api/issues/search?projectKeys=<proj>&p=1&ps=1" -Headers $Headers
+irm "http://localhost:9000/api/issues/search?projects=<proj>&p=1&ps=1"    -Headers $Headers
+irm "http://localhost:9000/api/issues/search?componentKeys=<proj>&p=1&ps=1" -Headers $Headers
+irm "http://localhost:9000/api/issues/v2/search?projectKeys=<proj>&p=1&ps=1" -Headers $Headers
