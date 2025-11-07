@@ -2,7 +2,7 @@
 param(
     [Parameter(Mandatory)][string]$ServerUrl,
     [Parameter(Mandatory)][string]$Token,
-    [Parameter(Mandatory)][string]$ProjectKey,  # Confirm from UI (Projects > Key where 68 issues shown)
+    [Parameter(Mandatory)][string]$ProjectKey,
     [Parameter(Mandatory)][string]$OutputPath,
     [int]$SnippetLinesBefore = 5,
     [int]$SnippetLinesAfter = 5,
@@ -21,7 +21,7 @@ $testUri = "$ServerUrl/api/system/status"
 try { $status = Invoke-RestMethod -Uri $testUri -Headers $headers -SkipCertificateCheck -ErrorAction Stop; Write-Info "Connected to $($status.version)" }
 catch { Write-Error "Connection failed: $($_.Exception.Message)"; return }
 
-# Rule Details (CWE for Security)
+# Rule Details
 function Get-RuleDetails { param([string]$RuleKey)
     $uri = "$ServerUrl/api/rules/show?key=$RuleKey&actives_only=true"
     try {
@@ -33,7 +33,7 @@ function Get-RuleDetails { param([string]$RuleKey)
 
 # Code Snippet
 function Get-CodeSnippet { param([string]$ComponentKey, [int]$LineNumber)
-    if (-not $LineNumber) { Write-Warn "File-level hotspot: $ComponentKey (e.g., review RFC auth)"; return 'File-level security hotspot: Review full source for risks like CWE-284 (auth bypass, SAP Note 2800347)' }
+    if (-not $LineNumber) { Write-Warn "File-level hotspot: $ComponentKey"; return 'File-level security hotspot: Review full source for risks like CWE-284 (auth bypass, SAP Note 2800347)' }
     $uri = "$ServerUrl/api/sources/raw?key=$ComponentKey"
     try {
         $source = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
@@ -46,41 +46,53 @@ function Get-CodeSnippet { param([string]$ComponentKey, [int]$LineNumber)
     } catch { Write-Warn "Snippet failed: $ComponentKey (Line $LineNumber)"; return 'Source unavailable (check "See Source Code" perm)' }
 }
 
-# Fetch All Issues (Include Resolved for UI Match)
-$allIssues = @()
+# Fetch Vulnerabilities (/api/issues/search)
+$allVulns = @()
 $page = 1
 do {
-    $params = @{ componentKeys = $ProjectKey; ps = $PageSize; p = $page }
+    $params = @{ componentKeys = $ProjectKey; types = 'VULNERABILITY'; ps = $PageSize; p = $page }
     $uri = "$ServerUrl/api/issues/search?" + ($params.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '&'
-    Write-Info "Fetching page ${page}..."
+    Write-Info "Fetching Vulns page ${page}..."
     try {
         $resp = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
-        Write-Info "Raw: total=$($resp.paging.total), page=$($resp.paging.pageIndex)/$($resp.paging.pages)"
-        $issues = $resp.issues
-        $allIssues += $issues
-        Write-Info "   → $($issues.Count) issues (cumulative: $($allIssues.Count))"
+        Write-Info "Raw Vulns: total=$($resp.paging.total), page=$($resp.paging.pageIndex)/$($resp.paging.pages)"
+        $allVulns += $resp.issues
         $page++
-    } catch {
-        Write-Error "API failed on page ${page}: $($_.Exception.Message)"
-        break
+    } catch { Write-Error "Vulns API failed on page ${page}: $($_.Exception.Message)"; break }
+} while ($allVulns.Count -lt $resp.paging.total -and $resp.issues.Count -gt 0)
+
+# Fetch Hotspots (/api/hotspots/search)
+$allHotspots = @()
+$page = 1
+do {
+    $params = @{ projectKey = $ProjectKey; ps = $PageSize; p = $page }
+    $uri = "$ServerUrl/api/hotspots/search?" + ($params.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '&'
+    Write-Info "Fetching Hotspots page ${page}..."
+    try {
+        $resp = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
+        Write-Info "Raw Hotspots: total=$($resp.paging.total), page=$($resp.paging.pageIndex)/$($resp.paging.pages)"
+        $allHotspots += $resp.hotspots
+        $page++
+    } catch { Write-Error "Hotspots API failed on page ${page}: $($_.Exception.Message)"; break }
+} while ($allHotspots.Count -lt $resp.paging.total -and $resp.hotspots.Count -gt 0)
+
+# Combine (Vulns + Hotspots, normalize fields)
+$allSecurity = $allVulns + $allHotspots | ForEach-Object {
+    $item = $_
+    [PSCustomObject]@{
+        rule = $item.rule ?? $item.ruleKey
+        severity = $item.severity
+        type = $item.type ?? 'SECURITY_HOTSPOT'
+        component = $item.component ?? $item.componentKey
+        line = $item.line
+        message = $item.message
     }
-} while ($allIssues.Count -lt $resp.paging.total -and $issues.Count -gt 0)
-
-if ($allIssues.Count -eq 0) {
-    Write-Warn "0 issues via API. UI 68 may be for different project/key or statuses. Confirm Project Key from UI (Projects > Key)."
-    return
 }
 
-# Filter to Security Locally (VULNERABILITY + SECURITY_HOTSPOT)
-$securityIssues = $allIssues | Where-Object { $_.type -in 'VULNERABILITY', 'SECURITY_HOTSPOT' }
-
-if ($securityIssues.Count -eq 0) {
-    Write-Warn "0 Security issues (UI shows 68—check if types match VULNERABILITY/SECURITY_HOTSPOT or use full export)."
-    return
-}
+if ($allSecurity.Count -eq 0) { Write-Warn "0 Security (Vulns + Hotspots). Confirm UI project key and token perms."; return }
 
 # Export
-$export = foreach ($i in $securityIssues) {
+$export = foreach ($i in $allSecurity) {
     $rule = Get-RuleDetails -RuleKey $i.rule
     $snippet = Get-CodeSnippet -ComponentKey $i.component -LineNumber $i.line
     $file = ($i.component -replace "^$ProjectKey`:", '').Split('/')[-1]
@@ -99,6 +111,6 @@ $export = foreach ($i in $securityIssues) {
 }
 
 $export | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-Write-Info "Exported $($export.Count) Security issues to $OutputPath (match UI 68)"
+Write-Info "Exported $($export.Count) Security issues (Vulns + Hotspots) to $OutputPath"
 Write-Info "Sample CRITICAL/HIGH:"
 $export | Where-Object Severity -in 'CRITICAL','HIGH' | Select-Object -First 1 | Format-List
