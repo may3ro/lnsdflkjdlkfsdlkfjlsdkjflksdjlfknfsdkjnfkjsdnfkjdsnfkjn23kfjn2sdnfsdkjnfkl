@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory=$true)]
-    [string]$ServerUrl,
+    [string]$ServerUrl,  # e.g., "https://your-sonarqube.com" – NO trailing slash
     
     [Parameter(Mandatory=$true)]
     [string]$Token,
@@ -15,71 +15,121 @@ param(
     
     [int]$SnippetLinesAfter = 3,
     
-    [int]$PageSize = 500
+    [int]$PageSize = 500,
+    
+    [switch]$SkipCertCheck  # For self-signed HTTPS
 )
 
-# Headers for API auth
+# Headers
 $headers = @{
     'Authorization' = "Basic $([Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Token")))"
 }
 
-# Function to fetch rule details (recommendation)
+# RestMethod params for SSL/proxy
+$restParams = @{
+    Headers = $headers
+    Method = 'Get'
+}
+if ($SkipCertCheck) { $restParams['SkipCertificateCheck'] = $true }
+
+Write-Host "Starting export for $ProjectKey..." -ForegroundColor Green
+
+# Auth test (inline)
+Write-Host "Validating auth..." -ForegroundColor Yellow
+try {
+    $authUri = "$ServerUrl/api/authentication/validate"
+    Invoke-RestMethod -Uri $authUri @restParams | Out-Null
+    Write-Host "Auth OK." -ForegroundColor Green
+} catch {
+    Write-Error "Auth error: $($_.Exception.Message). Check token/URL."
+    exit 1
+}
+
+# Fetch rule details
 function Get-RuleDetails {
     param($RuleKey)
-    $uri = "$ServerUrl/api/rules/show?key=$RuleKey&actives=true"
+    Write-Host "Fetching rule: $RuleKey" -ForegroundColor Cyan
+    $uri = "$ServerUrl/api/rules/show?key=${RuleKey}&actives=true"
     try {
-        $response = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
+        $response = Invoke-RestMethod -Uri $uri @restParams
+        $rec = if ($response.rule.htmlDesc) { $response.rule.htmlDesc -replace '<[^>]+>','' -replace "`r`n", ' ' } else { 'N/A' }
         return @{
-            Recommendation = $response.rule.htmlDesc -replace '<[^>]+>',''  # Strip HTML for clean text
-            Effort = if ($response.rule.remedialEffort) { $response.rule.remedialEffort } else { 'Unknown' }
+            Recommendation = $rec.Substring(0, [Math]::Min(500, $rec.Length))  # Trunc for CSV
+            Effort = if ($response.rule.effort) { $response.rule.effort } else { 'Unknown' }
         }
     } catch {
-        return @{ Recommendation = 'No recommendation available'; Effort = 'Unknown' }
+        Write-Warning "Rule fetch failed: $RuleKey - $($_.Exception.Message)"
+        return @{ Recommendation = 'No recommendation'; Effort = 'Unknown' }
     }
 }
 
-# Function to get code snippet from source
+# Get code snippet
 function Get-CodeSnippet {
     param($ComponentKey, $LineNumber)
-    $uri = "$ServerUrl/api/sources/raw?key=$ComponentKey"
+    Write-Host "Fetching snippet: $ComponentKey (line $LineNumber)" -ForegroundColor Cyan
+    $uri = "$ServerUrl/api/sources/raw?key=${ComponentKey}"
     try {
-        $source = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
-        $lines = $source -split "`n"
-        $startLine = [Math]::Max(1, $LineNumber - $SnippetLinesBefore)
-        $endLine = [Math]::Min($lines.Count, $LineNumber + $SnippetLinesAfter)
-        $snippet = ($lines[$startLine-1..($endLine-1)] | ForEach-Object { "Line $($_.Index + $startLine): $_" }) -join "`n"
-        return $snippet
+        $source = Invoke-RestMethod -Uri $uri @restParams
+        if (-not $source) { return 'Empty source file' }
+        $lines = $source -split "`n" | Where-Object { $_ }
+        if ($lines.Count -eq 0) { return 'No lines in file' }
+        $start = [Math]::Max(1, $LineNumber - $SnippetLinesBefore)
+        $end = [Math]::Min($lines.Count, $LineNumber + $SnippetLinesAfter)
+        $snippetLines = @()
+        for ($i = $start; $i -le $end; $i++) {
+            $snippetLines += "L$i`: $($lines[$i-1])"
+        }
+        return ($snippetLines -join "`n").Substring(0, [Math]::Min(2000, $snippetLines.Count * 100))  # Cap for CSV
     } catch {
-        return "Error fetching source for $ComponentKey (Line $LineNumber)"
+        Write-Warning "Snippet failed: $ComponentKey - $($_.Exception.Message)"
+        return "Fetch error: $($_.Exception.Message.Split(':')[0])"
     }
 }
 
-# Collect all issues (handle pagination)
+# Paginate issues
 $allIssues = @()
 $page = 1
-$total = 0
-
 do {
-    $uri = "$ServerUrl/api/issues/search?componentKeys=$ProjectKey&ps=$PageSize&p=$page"
-    $response = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
-    $issues = $response.issues
-    $allIssues += $issues
-    $total = $response.total
-    $page++
-} while (($allIssues.Count -lt $total) -and ($issues.Count -gt 0))
+    $uri = "$ServerUrl/api/issues/search?componentKeys=$([Uri]::EscapeDataString($ProjectKey))&ps=$PageSize&p=$page"
+    Write-Host "Fetching page $page (URI: $uri)" -ForegroundColor Yellow
+    try {
+        $response = Invoke-RestMethod -Uri $uri @restParams
+        $issues = $response.issues
+        $allIssues += $issues
+        Write-Host "Page $page: $($issues.Count) issues. Total so far: $($allIssues.Count)/$($response.total)" -ForegroundColor Green
+        if ($issues.Count -eq 0) { break }
+        Start-Sleep -Milliseconds 100  # Throttle if needed
+        $page++
+    } catch {
+        Write-Error "Pagination error page $page`: $($_.Exception.Message)"
+        break
+    }
+} while ($allIssues.Count -lt $response.total -and $page -le 20)  # Safety cap
 
-# Process issues
+if ($allIssues.Count -eq 0) {
+    Write-Warning "No issues found. Check project key/permissions."
+    exit 1
+}
+
+# Process
 $exportData = @()
+$counter = 0
 foreach ($issue in $allIssues) {
+    $counter++
+    Write-Host "Processing $counter/$($allIssues.Count): $($issue.rule)" -ForegroundColor Cyan
     $ruleDetails = Get-RuleDetails -RuleKey $issue.rule
-    $snippet = if ($issue.line) { Get-CodeSnippet -ComponentKey $issue.component -LineNumber $issue.line } else { 'No specific line (e.g., file-level issue)' }
+    $snippet = if ($issue.line) { 
+        Get-CodeSnippet -ComponentKey $issue.component -LineNumber $issue.line 
+    } else { 
+        'File-level issue (no line)' 
+    }
     
     $exportData += [PSCustomObject]@{
         'Rule ID' = $issue.rule
         'Severity' = $issue.severity
         'Type' = $issue.type
-        'Component' = $issue.component
-        'Line' = $issue.line
+        'Component' = $issue.component -replace '^[^:]+:', ''  # Clean ABAP path
+        'Line' = if ($issue.line) { $issue.line } else { 'N/A' }
         'Message' = $issue.message
         'Recommendation' = $ruleDetails.Recommendation
         'Effort' = $ruleDetails.Effort
@@ -87,6 +137,7 @@ foreach ($issue in $allIssues) {
     }
 }
 
-# Export to CSV
+# Export
 $exportData | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-Write-Host "Exported $($allIssues.Count) issues to $OutputPath"
+$exportData | ConvertTo-Json -Depth 3 | Out-File "$OutputPath.json"  # Fallback for snippets
+Write-Host "Exported $($allIssues.Count) issues to $OutputPath (CSV) and $OutputPath.json" -ForegroundColor Green
