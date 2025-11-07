@@ -1,146 +1,25 @@
-# ================================
-# SonarQube ABAP Export (PS 7.5.4)
-# ================================
-$Base        = 'http://localhost:9000'
-$UserToken   = '<YOUR_USER_TOKEN>'
-$ProjectKey  = 'abap-all-test3'     # your project
-$Branch      = 'main'               # set '' if not needed
-$PullRequest = ''                   # PR number or ''
-$OutCsv      = 'SonarQube_ABAP_Security_Report.csv'
-$UseShowOnly = $false               # set $true if /sources/raw is blocked
-
-# --- auth
-$pair   = $UserToken + ':'
-$basic  = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
-$H      = @{ Authorization = "Basic $basic" }
-
-function Add-QS($url, $kv) {
-  $pairs = foreach ($k in $kv.Keys) {
-    if ($null -ne $kv[$k] -and $kv[$k] -ne '') {
-      '{0}={1}' -f [uri]::EscapeDataString($k), [uri]::EscapeDataString([string]$kv[$k])
+function Add-QS {
+    param([string]$url, [hashtable]$kv)
+    $pairs = foreach ($k in $kv.Keys) {
+        if ($null -ne $kv[$k] -and $kv[$k] -ne '') {
+            '{0}={1}' -f [uri]::EscapeDataString($k), [uri]::EscapeDataString([string]$kv[$k])
+        }
     }
-  }
-  if (-not $pairs) { return $url }
-  if ($url -like '*?*') { "$url&$($pairs -join '&')" } else { "$url?$($pairs -join '&')" }
+    if (-not $pairs -or $pairs.Count -eq 0) { return $url }
+
+    if ($url.Contains('?')) { "$url&$($pairs -join '&')" }
+    else                    { "$url?$($pairs -join '&')" }
 }
 
-function GET($u) {
-  try { Invoke-RestMethod -Uri $u -Headers $H -Method Get -ErrorAction Stop } catch { $null }
-}
 
-# --- issues (use components)
-function Get-Issues($projectKey) {
-  $all = @(); $page = 1; $ps = 500
-  do {
-    $url = Add-QS "$Base/api/issues/search" @{ components=$projectKey; p=$page; ps=$ps; branch=$Branch; pullRequest=$PullRequest }
-    $r = GET $url
-    if (-not $r) { throw "Issues call failed: $url" }
-    if ($r.issues) { $all += $r.issues }
-    $total = [int]$r.paging.total
-    $page++
-  } while ($all.Count -lt $total)
-  $all
-}
 
-function Get-Rule($ruleKey) {
-  $r = GET (Add-QS "$Base/api/rules/show" @{ key=$ruleKey })
-  if ($r -and $r.rule) { $r.rule } else { $null }
-}
+$Base       = 'http://localhost:9000'
+$Endpoint   = '/api/issues/search'
+$ProjectKey = 'abap-all-test3'
+$Branch     = 'main'     # or '' if not needed
 
-function Strip-Html([string]$s) {
-  if (-not $s) { return '' }
-  (($s -replace '<[^>]+>', '') -replace '\s+', ' ').Trim()
-}
+$u = Add-QS "$Base$Endpoint" @{ components=$ProjectKey; p=1; ps=10; branch=$Branch }
+$u
+irm $u -Headers $H | Select-Object -ExpandProperty paging
 
-function Get-SourceLines($componentKey) {
-  if (-not $UseShowOnly) {
-    $raw = GET (Add-QS "$Base/api/sources/raw" @{ key=$componentKey; branch=$Branch; pullRequest=$PullRequest })
-    if ($raw) { return ($raw -split "`n") }
-  }
-  $show = GET (Add-QS "$Base/api/sources/show" @{ key=$componentKey; branch=$Branch; pullRequest=$PullRequest })
-  if ($show -and $show.sources) { return @($show.sources | ForEach-Object { $_.code }) }
-  $null
-}
 
-function Get-Snippet($componentKey, [int]$line) {
-  if (-not $line -or $line -le 0) { return '' }
-  $lines = Get-SourceLines $componentKey
-  if (-not $lines) { return '' }
-  $start = [Math]::Max(1, $line - 3)
-  $end   = [Math]::Min($lines.Length, $line + 3)
-  ($start..$end | ForEach-Object { '{0,4}: {1}' -f $_, $lines[$_-1] }) -join "`n"
-}
-
-# --- run
-$issues = Get-Issues $ProjectKey
-$work = $issues | ForEach-Object {
-  $line = if ($_.line) { [int]$_.line } elseif ($_.textRange.startLine) { [int]$_.textRange.startLine } else { $null }
-  [pscustomobject]@{ Issue=$_; Line=$line; Component=$_.component; RuleKey=$_.rule }
-}
-
-$Throttle = 8
-$results = $work | ForEach-Object -Parallel {
-  param($Base,$H,$Branch,$PullRequest,$UseShowOnly)
-
-  function Strip-Html([string]$s) { if (-not $s) { return '' } (($s -replace '<[^>]+>', '') -replace '\s+', ' ').Trim() }
-
-  # rule
-  $r = Invoke-RestMethod -Uri ("{0}/api/rules/show?key={1}" -f $Base, [uri]::EscapeDataString($PSItem.RuleKey)) -Headers $H -Method Get
-  $rule = if ($r -and $r.rule) { $r.rule } else { $null }
-
-  # snippet
-  $snippet = ''
-  if ($PSItem.Line) {
-    $lines = $null
-    if (-not $UseShowOnly) {
-      try {
-        $u = "{0}/api/sources/raw?key={1}" -f $Base, [uri]::EscapeDataString($PSItem.Component)
-        if ($Branch)      { $u += "&branch=$([uri]::EscapeDataString($Branch))" }
-        if ($PullRequest) { $u += "&pullRequest=$([uri]::EscapeDataString($PullRequest))" }
-        $raw = Invoke-RestMethod -Uri $u -Headers $H -Method Get
-        if ($raw) { $lines = $raw -split "`n" }
-      } catch {}
-    }
-    if (-not $lines) {
-      try {
-        $u = "{0}/api/sources/show?key={1}" -f $Base, [uri]::EscapeDataString($PSItem.Component)
-        if ($Branch)      { $u += "&branch=$([uri]::EscapeDataString($Branch))" }
-        if ($PullRequest) { $u += "&pullRequest=$([uri]::EscapeDataString($PullRequest))" }
-        $show = Invoke-RestMethod -Uri $u -Headers $H -Method Get
-        if ($show -and $show.sources) { $lines = @($show.sources | ForEach-Object { $_.code }) }
-      } catch {}
-    }
-    if ($lines) {
-      $start = [Math]::Max(1, $PSItem.Line - 3)
-      $end   = [Math]::Min($lines.Length, $PSItem.Line + 3)
-      $snippet = ($start..$end | ForEach-Object { '{0,4}: {1}' -f $_, $lines[$_-1] }) -join "`n"
-    }
-  }
-
-  $ruleName = $rule?.name ?? $PSItem.RuleKey
-  $descHtml = $rule?.htmlDesc ?? $rule?.mdDesc
-  $desc     = Strip-Html $descHtml
-  $reco     = if ($rule?.remediation) { Strip-Html ( ($rule.remediation.func ?? '') + ' ' + ($rule.remediation.gapDescription ?? '') ) }
-              elseif ($rule?.debtRemFnBaseEffort) { Strip-Html $rule.debtRemFnBaseEffort } else { $desc }
-
-  [pscustomobject]@{
-    File           = $PSItem.Component
-    Line           = $PSItem.Line
-    RuleKey        = $PSItem.RuleKey
-    RuleName       = $ruleName
-    Description    = $desc
-    Recommendation = $reco
-    CodeSnippet    = $snippet
-    Severity       = $PSItem.Issue.severity
-    Type           = $PSItem.Issue.type
-    Message        = $PSItem.Issue.message
-  }
-} -ThrottleLimit $Throttle -ArgumentList $Base,$H,$Branch,$PullRequest,$UseShowOnly
-
-$branchOut = $Branch ? $Branch : 'main'
-$results | Select-Object @{n='Project';e={$ProjectKey}},
-                        @{n='Branch';e={$branchOut}},
-                        File, Line, Severity, Type, RuleKey, RuleName, Message, Description, Recommendation, CodeSnippet |
-  Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8
-
-"Export complete: $OutCsv"
