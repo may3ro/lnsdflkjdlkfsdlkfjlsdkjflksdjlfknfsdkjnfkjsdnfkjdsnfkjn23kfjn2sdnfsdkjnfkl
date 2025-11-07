@@ -14,7 +14,70 @@ $PullRequest  = ""          # e.g. "123" or "" if not PR
 $OutputCsv    = "SonarQube_ABAP_Security_Report.csv"
 $Throttle     = 8           # parallelism for rule/source fetch (tune to your server)
 $UseShowOnly  = $false      # set $true if /api/sources/raw is blocked by policy
+# ---- Put these at the top (after token/headers) ----
+function Test-200($url) {
+    try {
+        $r = Invoke-RestMethod -Uri $url -Headers $Headers -Method Get -ErrorAction Stop
+        return $r
+    } catch {
+        return $null
+    }
+}
 
+function Resolve-SQ {
+    param([string]$Base)  # e.g. "http://localhost:9000"
+
+    # 1) resolve context path
+    $candidates = @(
+        $Base.TrimEnd('/'),
+        ($Base.TrimEnd('/') + "/sonarqube"),
+        ($Base.TrimEnd('/') + "/sonar")
+    )
+    $resolvedBase = $null
+    foreach ($b in $candidates) {
+        if (Test-200 ($b + "/api/server/version")) { $resolvedBase = $b; break }
+    }
+    if (-not $resolvedBase) { throw "Cannot reach SonarQube at $Base (server/version 404)." }
+
+    # 2) resolve issues endpoint + param name
+    $endpoints = @("/api/issues/search","/api/issues/v2/search")
+    $paramNames = @("projectKeys","projects","componentKeys")
+
+    $issuesUrl = $null
+    $paramName = $null
+    foreach ($ep in $endpoints) {
+        foreach ($pn in $paramNames) {
+            $probe = "$resolvedBase$ep?$pn=_probe_&p=1&ps=1"
+            $r = Test-200 $probe
+            if ($r -and $r.paging) { $issuesUrl = "$resolvedBase$ep"; $paramName = $pn; break }
+        }
+        if ($issuesUrl) { break }
+    }
+    if (-not $issuesUrl) {
+        throw "Cannot resolve /api/issues endpoint (search and search v2 both 404). Check /web_api in your instance."
+    }
+
+    # return an object with helpers
+    [pscustomobject]@{
+        BaseUrl     = $resolvedBase
+        IssuesUrl   = $issuesUrl
+        ParamName   = $paramName
+        BuildIssues = {
+            param($projectKey, $page, $pageSize, $branch, $pr)
+            $qs = @{}
+            $qs[$paramName] = $projectKey
+            $qs["p"]  = $page
+            $qs["ps"] = $pageSize
+            if ($branch) { $qs["branch"] = $branch }
+            if ($pr)     { $qs["pullRequest"] = $pr }
+            # join
+            $pairs = $qs.GetEnumerator() | ForEach-Object {
+                "{0}={1}" -f [uri]::EscapeDataString($_.Key), [uri]::EscapeDataString([string]$_.Value)
+            }
+            "$issuesUrl?{0}" -f ($pairs -join "&")
+        }
+    }
+}
 # Optional: skip TLS checks (self-signed lab)
 $Global:SkipTLS = $false    # set true if you have a self-signed cert
 
