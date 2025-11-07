@@ -25,7 +25,7 @@ catch { Write-Error "Connection failed: $($_.Exception.Message)"; return }
 function Get-RuleDetails { param([string]$RuleKey)
     $uri = "$ServerUrl/api/rules/show?key=$RuleKey&actives_only=true"
     try {
-        $r = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
+        $r = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateWatch -ErrorAction Stop
         $desc = ($r.rule.htmlDesc -replace '<[^>]+>', '' -replace "`r`n","`n").Trim()
         return @{ Recommendation = ($desc -split "`n" | Where-Object {$_} | ForEach-Object Trim) -join ' '; Effort = $r.rule.remedialEffort ?? 'Unknown'; CWE = $r.rule.cwe ? ($r.rule.cwe -join ', ') : '' }
     } catch { Write-Warn "Rule $RuleKey failed"; return @{ Recommendation = 'N/A'; Effort = 'Unknown'; CWE = '' } }
@@ -46,60 +46,32 @@ function Get-CodeSnippet { param([string]$ComponentKey, [int]$LineNumber)
     } catch { Write-Warn "Snippet failed: $ComponentKey (Line $LineNumber)"; return 'Source unavailable (check "See Source Code" perm)' }
 }
 
-# Fetch Vulnerabilities
-$allVulns = @()
-$page = 1
-do {
-    $params = @{ componentKeys = $ProjectKey; types = 'VULNERABILITY'; ps = $PageSize; p = $page }
-    $uri = "$ServerUrl/api/issues/search?" + ($params.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '&'
-    Write-Info "Fetching Vulns page ${page}..."
-    try {
-        $resp = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
-        Write-Info "Raw Vulns: total=$($resp.paging.total), page=$($resp.paging.pageIndex)/$($resp.paging.pages)"
-        $allVulns += $resp.issues
-        $page++
-    } catch { Write-Error "Vulns API failed on page ${page}: $($_.Exception.Message)"; break }
-} while ($allVulns.Count -lt $resp.paging.total -and $resp.issues.Count -gt 0)
-
-# Fetch Hotspots – FIXED: Use @{} not {}
+# Fetch Security Hotspots Only (68 in UI under "Security")
 $allHotspots = @()
 $page = 1
 do {
-    $params = @{ projectKey = $ProjectKey; ps = $PageSize; p = $page }  # <-- FIXED: @{}
+    $params = @{ projectKey = $ProjectKey; ps = $PageSize; p = $page }
     $uri = "$ServerUrl/api/hotspots/search?" + ($params.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '&'
-    Write-Info "Fetching Hotspots page ${page}..."
+    Write-Info "Fetching Security Hotspots page ${page}..."
     try {
         $resp = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
-        Write-Info "Raw Hotspots: total=$($resp.paging.total), page=$($resp.paging.pageIndex)/$($resp.paging.pages)"
+        Write-Info "Raw: total=$($resp.paging.total), page=$($resp.paging.pageIndex)/$($resp.paging.pages)"
         $allHotspots += $resp.hotspots
         $page++
     } catch { Write-Error "Hotspots API failed on page ${page}: $($_.Exception.Message)"; break }
 } while ($allHotspots.Count -lt $resp.paging.total -and $resp.hotspots.Count -gt 0)
 
-# Combine
-$allSecurity = $allVulns + $allHotspots | ForEach-Object {
-    $item = $_
-    [PSCustomObject]@{
-        rule = $item.rule ?? $item.ruleKey
-        severity = $item.severity
-        type = $item.type ?? 'SECURITY_HOTSPOT'
-        component = $item.component ?? $item.componentKey
-        line = $item.line
-        message = $item.message
-    }
-}
-
-if ($allSecurity.Count -eq 0) { Write-Warn "0 Security (Vulns + Hotspots). Confirm UI project key."; return }
+if ($allHotspots.Count -eq 0) { Write-Warn "0 Security Hotspots. Confirm project key and token."; return }
 
 # Export
-$export = foreach ($i in $allSecurity) {
-    $rule = Get-RuleDetails -RuleKey $i.rule
-    $snippet = Get-CodeSnippet -ComponentKey $i.component -LineNumber $i.line
-    $file = ($i.component -replace "^$ProjectKey`:", '').Split('/')[-1]
+$export = foreach ($i in $allHotspots) {
+    $rule = Get-RuleDetails -RuleKey $i.ruleKey
+    $snippet = Get-CodeSnippet -ComponentKey $i.componentKey -LineNumber $i.line
+    $file = ($i.componentKey -replace "^$ProjectKey`:", '').Split('/')[-1]
     [PSCustomObject]@{
-        'Rule ID'        = $i.rule
-        'Severity'       = $i.severity
-        'Type'           = $i.type
+        'Rule ID'        = $i.ruleKey
+        'Severity'       = $i.securityCategory
+        'Type'           = 'SECURITY_HOTSPOT'
         'ABAP File'      = $file
         'Line'           = $i.line
         'Message'        = $i.message
@@ -111,6 +83,6 @@ $export = foreach ($i in $allSecurity) {
 }
 
 $export | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-Write-Info "Exported $($export.Count) Security issues to $OutputPath"
-Write-Info "Sample CRITICAL/HIGH:"
-$export | Where-Object Severity -in 'CRITICAL','HIGH' | Select-Object -First 1 | Format-List
+Write-Info "Exported $($export.Count) Security Hotspots to $OutputPath"
+Write-Info "Sample HIGH:"
+$export | Where-Object Severity -eq 'HIGH' | Select-Object -First 1 | Format-List
