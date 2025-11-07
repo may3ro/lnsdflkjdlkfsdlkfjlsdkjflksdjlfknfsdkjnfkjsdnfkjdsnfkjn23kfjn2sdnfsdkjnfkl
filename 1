@@ -1,5 +1,38 @@
-irm "http://localhost:9000/api/issues/search?projectKeys=<proj>&p=1&ps=1" -Headers $Headers
-irm "http://localhost:9000/api/issues/search?projects=<proj>&p=1&ps=1"    -Headers $Headers
-irm "http://localhost:9000/api/issues/search?componentKeys=<proj>&p=1&ps=1" -Headers $Headers
-irm "http://localhost:9000/api/issues/v2/search?projectKeys=<proj>&p=1&ps=1" -Headers $Headers
- 
+$UserToken = '<YOUR_USER_TOKEN>'
+$pair   = $UserToken + ':'
+$basic  = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+$H      = @{ Authorization = "Basic $basic" }
+$Base   = 'http://localhost:9000'
+# List all web services/actions the server exposes
+$ws = irm "$Base/api/webservices/list" -Headers $H
+
+# Find the issues service (supports both v1 and v2 paths)
+$issuesSvc = $ws.webServices | Where-Object { $_.path -match '^api(\/v\d+)?/issues$' } | Select-Object -First 1
+if (-not $issuesSvc) { throw "Couldn't find 'api/.../issues' service on this server. Open $Base/web_api in a browser to confirm." }
+
+# Find the 'search' action under that service
+$searchAction = $issuesSvc.actions | Where-Object { $_.key -eq 'search' } | Select-Object -First 1
+if (-not $searchAction) { throw "Issues service found, but 'search' action is missing. Check $Base/web_api." }
+
+$IssuesEndpoint = "/$($issuesSvc.path)/$($searchAction.key)"   # e.g. /api/issues/search or /api/v2/issues/search
+$ResolvedIssuesUrl = "$Base$IssuesEndpoint"
+$ResolvedIssuesUrl
+# Try common param names and pick the first that returns a 'paging' object
+$ProjectKey = 'abap-all-test3'   # <-- put your real project key here
+$paramNames = @('projectKeys','projects','componentKeys')
+$workingParam = $null
+
+foreach ($p in $paramNames) {
+  try {
+    $u = "$ResolvedIssuesUrl?$p=$([uri]::EscapeDataString($ProjectKey))&p=1&ps=1"
+    $r = irm $u -Headers $H
+    if ($r -and $r.paging) { $workingParam = $p; break }
+  } catch { }
+}
+
+if (-not $workingParam) { throw "None of $($paramNames -join ', ') worked at $ResolvedIssuesUrl. Open $Base/web_api and check the exact parameter name for the search action." }
+"Using endpoint: $ResolvedIssuesUrl  with param: $workingParam"
+$testUrl = "$ResolvedIssuesUrl?$workingParam=$([uri]::EscapeDataString($ProjectKey))&p=1&ps=10"
+$issues = irm $testUrl -Headers $H
+$issues.paging
+$issues.issues | Select-Object key, rule, severity, component, message -First 3
