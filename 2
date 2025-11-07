@@ -1,81 +1,105 @@
-# SonarQube Export Script for ABAP Code Security Review
-# Exports issues with code snippets, rule details, and recommendations
-# Author: [Your Name]
-# Context: SAP ABAP Secure Code Assessment
+# ====================================================================
+# SonarQube ABAP Code Security Export
+# Compatible with PowerShell 5.1
+# ====================================================================
 
-# ===== CONFIGURATION =====
+# ---- CONFIG ----
 $SonarQubeUrl = "https://your-sonarqube-server"
 $Token = "YOUR_TOKEN"
 $ProjectKey = "your_project_key"
 $OutputFile = "SonarQube_ABAP_Security_Report.csv"
 
-# ===== AUTH & HEADERS =====
-$Headers = @{
-    "Authorization" = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$Token:"))
-}
+# ---- AUTH ----
+$pair = "$Token:"
+$encodedToken = [System.Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes($pair))
+$Headers = @{ Authorization = "Basic $encodedToken" }
 
-# ===== FUNCTIONS =====
+# ---- FUNCTIONS ----
+
 function Get-SonarQubeIssues {
-    param($ProjectKey)
+    param([string]$ProjectKey)
     $PageSize = 500
     $Page = 1
     $AllIssues = @()
 
     do {
         $Url = "$SonarQubeUrl/api/issues/search?componentKeys=$ProjectKey&p=$Page&ps=$PageSize"
-        $Response = Invoke-RestMethod -Uri $Url -Headers $Headers -Method Get
-        $AllIssues += $Response.issues
-        $Page++
-    } while ($Response.paging.total -gt ($AllIssues.Count))
+        try {
+            $Response = Invoke-RestMethod -Uri $Url -Headers $Headers -Method Get
+            $AllIssues += $Response.issues
+            $Total = [int]$Response.paging.total
+            $Page++
+        } catch {
+            Write-Warning "Error retrieving page $Page: $_"
+            break
+        }
+    } while ($AllIssues.Count -lt $Total)
 
     return $AllIssues
 }
 
 function Get-RuleDetails {
-    param($RuleKey)
+    param([string]$RuleKey)
     $RuleUrl = "$SonarQubeUrl/api/rules/show?key=$RuleKey"
     try {
         $RuleResponse = Invoke-RestMethod -Uri $RuleUrl -Headers $Headers -Method Get
         return $RuleResponse.rule
     } catch {
+        Write-Warning "Cannot retrieve rule $RuleKey"
         return $null
     }
 }
 
 function Get-CodeSnippet {
-    param($Component, $Line)
+    param([string]$Component, [int]$Line)
     $RawUrl = "$SonarQubeUrl/api/sources/raw?key=$Component"
     try {
-        $Code = Invoke-RestMethod -Uri $RawUrl -Headers $Headers -Method Get
-        $Lines = $Code -split "`n"
-        $SnippetRange = (($Line - 3)..($Line + 3)) | Where-Object { $_ -gt 0 -and $_ -le $Lines.Count }
-        return ($SnippetRange | ForEach-Object { "$_:`t" + $Lines[$_-1] }) -join "`n"
+        $RawText = Invoke-RestMethod -Uri $RawUrl -Headers $Headers -Method Get
+        $Lines = $RawText -split "`n"
+        $Start = [Math]::Max(0, $Line - 4)
+        $End = [Math]::Min($Lines.Length - 1, $Line + 2)
+        $Snippet = ""
+        for ($i = $Start; $i -le $End; $i++) {
+            $Snippet += ("{0,4}: {1}`n" -f ($i + 1), $Lines[$i])
+        }
+        return $Snippet.Trim()
     } catch {
         return ""
     }
 }
 
-# ===== MAIN EXECUTION =====
+# ---- MAIN ----
+Write-Host "Retrieving issues for project $ProjectKey ..."
 $Issues = Get-SonarQubeIssues -ProjectKey $ProjectKey
-$Results = @()
+
+$ResultSet = @()
 
 foreach ($Issue in $Issues) {
     $RuleDetails = Get-RuleDetails -RuleKey $Issue.rule
-    $Snippet = Get-CodeSnippet -Component $Issue.component -Line $Issue.line
+    $Snippet = if ($Issue.line) { Get-CodeSnippet -Component $Issue.component -Line $Issue.line } else { "" }
 
-    $Results += [PSCustomObject]@{
-        Project      = $ProjectKey
-        File         = $Issue.component
-        Line         = $Issue.line
-        Type         = $Issue.type
-        Severity     = $Issue.severity
-        Rule         = $RuleDetails.name
-        Description  = $RuleDetails.htmlDesc -replace '<[^>]+>', ''
-        Recommendation = $RuleDetails.remediationFnBaseEffort -replace '<[^>]+>', ''
-        Message      = $Issue.message
-        CodeSnippet  = $Snippet
+    $Description = ""
+    $Recommendation = ""
+    if ($RuleDetails) {
+        $Description = ($RuleDetails.htmlDesc -replace '<[^>]+>', '') -replace '\s+', ' '
+        $Recommendation = ($RuleDetails.remediationFnBaseEffort -replace '<[^>]+>', '') -replace '\s+', ' '
+    }
+
+    $ResultSet += New-Object PSObject -Property @{
+        Project        = $ProjectKey
+        File           = $Issue.component
+        Line           = $Issue.line
+        Severity       = $Issue.severity
+        Type           = $Issue.type
+        RuleKey        = $Issue.rule
+        RuleName       = $RuleDetails.name
+        Message        = $Issue.message
+        Description    = $Description
+        Recommendation = $Recommendation
+        CodeSnippet    = $Snippet
     }
 }
 
-$Results | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
-Write-Host "Export completed: $OutputFile"
+Write-Host "Exporting to CSV..."
+$ResultSet | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
+Write-Host "Export complete: $OutputFile"
