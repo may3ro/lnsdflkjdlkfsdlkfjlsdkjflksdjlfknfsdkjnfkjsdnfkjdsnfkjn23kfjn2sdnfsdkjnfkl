@@ -1,14 +1,15 @@
 <#=====================================================================
-  Export-SonarQubeIssuesWithSnippets_2025.4.2_FIXED.ps1
-  – 100% compatible with SonarQube 2025.4.2 and PowerShell 5.1+
-  – No nullable operators, no syntax errors
+  Export-SonarQubeIssuesWithSnippets_2025.4.2_FINAL.ps1
+  – Works on SonarQube 2025.4.2 (any edition)
+  – Returns line-level snippets for ABAP (and any language)
+  – Handles file-level issues gracefully
 =====================================================================#>
 
 param(
-    [Parameter(Mandatory=$true)][string]$ServerUrl,
-    [Parameter(Mandatory=$true)][string]$Token,
-    [Parameter(Mandatory=$true)][string]$ProjectKey,
-    [Parameter(Mandatory=$true)][string]$OutputPath,
+    [Parameter(Mandatory)][string]$ServerUrl,      # e.g. https://sonarqube.mycorp.com
+    [Parameter(Mandatory)][string]$Token,          # API token (Browse permission)
+    [Parameter(Mandatory)][string]$ProjectKey,     # exact project key
+    [Parameter(Mandatory)][string]$OutputPath,     # full CSV path
     [int]$SnippetLinesBefore = 3,
     [int]$SnippetLinesAfter  = 3,
     [int]$PageSize           = 100,
@@ -26,38 +27,34 @@ $headers = @{
     'Authorization' = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Token"))
     'Accept'        = 'application/json'
 }
-
-# Skip self-signed certs (optional)
 $global:PSDefaultParameterValues['Invoke-RestMethod:SkipCertificateCheck'] = $true
 
 # --------------------------------------------------------------------
-# 1. Verify connection
-$testUri = "$ServerUrl/api/server/version"
+# 1. Verify connection – use a **real JSON endpoint**
+$testUri = "$ServerUrl/api/system/status"
 try {
-    $version = Invoke-RestMethod -Uri $testUri -Headers $headers -Method Get -ErrorAction Stop
-    Write-Info "Connected to SonarQube $version"
+    $status = Invoke-RestMethod -Uri $testUri -Headers $headers -Method Get -ErrorAction Stop
+    Write-Info "Connected to SonarQube $($status.version) – status: $($status.status)"
 }
 catch {
     Write-Error "Connection failed: $($_.Exception.Message)"
-    if ($_.Exception.Response.StatusCode -eq 401) { Write-Warn "Regenerate token" }
+    if ($_.Exception.Response.StatusCode -eq 401) { Write-Warn "Regenerate token (My Account > Security)" }
     exit 1
 }
 
 # --------------------------------------------------------------------
-# 2. Rule details
+# 2. Rule details (incl. CWE for 2025.4+)
 function Get-RuleDetails {
     param([string]$RuleKey)
     $uri = "$ServerUrl/api/rules/show?key=$RuleKey&actives_only=true"
     try {
         $r = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
         $desc = ($r.rule.htmlDesc -replace '<[^>]+>', '' -replace "`r`n","`n").Trim()
-        $cwe = ''
-        if ($IncludeCWE -and $r.rule.cwe) { $cwe = $r.rule.cwe -join ', ' }
-        $effort = 'Unknown'
-        if ($r.rule.remedialEffort) { $effort = $r.rule.remedialEffort }
+        $cwe  = if ($IncludeCWE -and $r.rule.cwe) { $r.rule.cwe -join ', ' } else { '' }
+        $eff  = if ($r.rule.remedialEffort) { $r.rule.remedialEffort } else { 'Unknown' }
         return @{
             Recommendation = ($desc -split "`n" | ForEach-Object Trim | Where-Object {$_}) -join ' '
-            Effort        = $effort
+            Effort        = $eff
             CWE           = $cwe
         }
     }
@@ -68,10 +65,10 @@ function Get-RuleDetails {
 }
 
 # --------------------------------------------------------------------
-# 3. Code snippet
+# 3. Code snippet – **now logs when line is missing**
 function Get-CodeSnippet {
     param([string]$ComponentKey, [int]$LineNumber)
-    
+
     if (-not $LineNumber) {
         Write-Warn "No line number for component: $ComponentKey → File-level issue"
         return 'File-level issue (no line number in SonarQube)'
@@ -95,13 +92,13 @@ function Get-CodeSnippet {
         return $snippet -join "`n"
     }
     catch {
-        Write-Warn "Failed to fetch source for $ComponentKey (Line $LineNumber): $($_.Exception.Message)"
+        Write-Warn "Source fetch failed for $ComponentKey (Line $LineNumber): $($_.Exception.Message)"
         return "Source unavailable (404 / permission / deleted)"
     }
 }
 
 # --------------------------------------------------------------------
-# 4. Fetch issues
+# 4. Pull issues (pagination)
 $allIssues = @()
 $page = 1
 $resolved = if ($IncludeResolved) { '' } else { '&resolved=false' }
@@ -124,17 +121,17 @@ do {
 } while ($allIssues.Count -lt $resp.paging.total -and $issues.Count -gt 0)
 
 if ($allIssues.Count -eq 0) {
-    Write-Warn "No issues found. Use -IncludeResolved or check ProjectKey."
+    Write-Warn "No issues returned. Verify ProjectKey, token scope, or add -IncludeResolved"
     exit 0
 }
 
 # --------------------------------------------------------------------
-# 5. Build export
+# 5. Build CSV rows
 $export = @()
 $cnt = 0
 foreach ($i in $allIssues) {
     $cnt++
-    Write-Progress -Activity "Processing Issues" -Status "$cnt/$($allIssues.Count)" -PercentComplete ($cnt/$allIssues.Count*100)
+    Write-Progress -Activity "Processing" -Status "$cnt/$($allIssues.Count)" -PercentComplete ($cnt/$allIssues.Count*100)
 
     $rule = Get-RuleDetails -RuleKey $i.rule
     $snip = Get-CodeSnippet -ComponentKey $i.component -LineNumber $i.line
@@ -152,11 +149,11 @@ foreach ($i in $allIssues) {
         'Snippet'        = ($snip.Substring(0,[Math]::Min(2000,$snip.Length))) + '...'
     }
 }
-Write-Progress -Activity "Processing Issues" -Completed
+Write-Progress -Activity "Processing" -Completed
 
 # --------------------------------------------------------------------
-# 6. Export CSV
+# 6. Export
 $export | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-Write-Info "Exported $($export.Count) issues to $OutputPath"
+Write-Info "SUCCESS: Exported $($export.Count) issues → $OutputPath"
 Write-Info "Sample row:"
 $export | Select-Object -First 1 | Format-List
