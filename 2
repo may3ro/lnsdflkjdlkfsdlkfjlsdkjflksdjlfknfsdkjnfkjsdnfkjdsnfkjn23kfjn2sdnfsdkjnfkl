@@ -2,7 +2,7 @@
 param(
     [Parameter(Mandatory)][string]$ServerUrl,
     [Parameter(Mandatory)][string]$Token,
-    [Parameter(Mandatory)][string]$ProjectKey,  # Use this; script verifies
+    [Parameter(Mandatory)][string]$ProjectKey,
     [Parameter(Mandatory)][string]$OutputPath,
     [int]$SnippetLinesBefore = 5,
     [int]$SnippetLinesAfter = 5,
@@ -21,13 +21,13 @@ $testUri = "$ServerUrl/api/system/status"
 try { $status = Invoke-RestMethod -Uri $testUri -Headers $headers -SkipCertificateCheck -ErrorAction Stop; Write-Info "Connected to $($status.version)" }
 catch { Write-Error "Connection failed: $($_.Exception.Message)"; return }
 
-# 1. List Projects to Verify Key (Find one with 68 Security issues)
-Write-Info "Listing projects to verify key..."
+# 1. List Projects to Verify Key
+Write-Info "Listing projects..."
 try {
     $projects = Invoke-RestMethod -Uri "$ServerUrl/api/projects/search" -Headers $headers -SkipCertificateCheck -ErrorAction Stop
     Write-Info "Available projects:"
-    $projects.components | Select-Object key, name, qualityGateStatus | Format-Table
-    if ($projects.components | Where-Object { $_.key -eq $ProjectKey } | Measure-Object | Select-Object -ExpandProperty Count -eq 0) {
+    $projects.components | ForEach-Object { Write-Host "Key: $($_.key) | Name: $($_.name)" }
+    if (-not ($projects.components.key -contains $ProjectKey)) {
         Write-Warn "ProjectKey '$ProjectKey' not found. Use one from the list above."
         return
     }
@@ -40,11 +40,11 @@ function Get-RuleDetails { param([string]$RuleKey)
     try {
         $r = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
         $desc = ($r.rule.htmlDesc -replace '<[^>]+>', '' -replace "`r`n","`n").Trim()
-        return @{ Recommendation = ($desc -split "`n" | Where-Object {$_} | ForEach-Object Trim) -join ' '; Effort = $r.rule.remedialEffort ?? 'Unknown'; CWE = $r.rule.cwe ? ($r.rule.cwe -join ', ') : '' }
-    } catch { Write-Warn "Rule $RuleKey failed"; return @{ Recommendation = 'N/A'; Effort = 'Unknown'; CWE = '' } }
+        return @{ Recommendation = ($desc -split "`n" | Where-Object {$_} | ForEach-Object Trim) -join ' '; CWE = $r.rule.cwe ? ($r.rule.cwe -join ', ') : '' }
+    } catch { return @{ Recommendation = 'N/A'; CWE = '' } }
 }
 
-# Code Snippet (File-level Preview)
+# Code Snippet
 function Get-CodeSnippet { param([string]$ComponentKey, [int]$LineNumber)
     $uri = "$ServerUrl/api/sources/raw?key=$ComponentKey"
     try {
@@ -62,10 +62,10 @@ function Get-CodeSnippet { param([string]$ComponentKey, [int]$LineNumber)
         $end = [Math]::Min($lines.Count, $LineNumber + $SnippetLinesAfter)
         $snippet = for ($i = $start-1; $i -lt $end; $i++) { "Line $($i+1): $($lines[$i])" }
         return $snippet -join "`n"
-    } catch { Write-Warn "Snippet failed: $ComponentKey"; return 'Source unavailable (check "See Source Code" perm)' }
+    } catch { return 'Source unavailable' }
 }
 
-# 2. Fetch Security Issues (softwareQualities=SECURITY for 68)
+# Fetch Security Issues
 $allSecurity = @()
 $page = 1
 do {
@@ -74,16 +74,13 @@ do {
     Write-Info "Fetching Security page ${page}..."
     try {
         $resp = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
-        Write-Info "Raw: total=$($resp.paging.total), page=$($resp.paging.pageIndex)/$($resp.paging.pages)"
+        Write-Info "Raw: total=$($resp.paging.total)"
         $allSecurity += $resp.issues
         $page++
-    } catch { Write-Error "API failed on page ${page}: $($_.Exception.Message)"; break }
+    } catch { Write-Error "API failed: $($_.Exception.Message)"; break }
 } while ($allSecurity.Count -lt $resp.paging.total -and $resp.issues.Count -gt 0)
 
-if ($allSecurity.Count -eq 0) {
-    Write-Warn "0 Security issues. If UI shows 68, check token perms (Browse + See Source Code) or project key."
-    return
-}
+if ($allSecurity.Count -eq 0) { Write-Warn "0 Security issues. Check project key."; return }
 
 # Export
 $export = foreach ($i in $allSecurity) {
@@ -94,18 +91,14 @@ $export = foreach ($i in $allSecurity) {
         'Rule ID'        = $i.rule
         'Severity'       = $i.severity
         'Type'           = $i.type
-        'Software Quality' = $i.softwareQuality
         'ABAP File'      = $file
         'Line'           = $i.line
         'Message'        = $i.message
-        'Recommendation' = ($rule.Recommendation.Substring(0, [Math]::Min(500, $rule.Recommendation.Length))) + '...'
-        'Effort'         = $rule.Effort
+        'Recommendation' = $rule.Recommendation
         'CWE'            = $rule.CWE
-        'Code Snippet'   = ($snippet.Substring(0, [Math]::Min(2000, $snippet.Length))) + '...'
+        'Code Snippet'   = $snippet
     }
 }
 
 $export | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
 Write-Info "Exported $($export.Count) Security issues to $OutputPath"
-Write-Info "Sample CRITICAL/HIGH:"
-$export | Where-Object Severity -in 'CRITICAL','HIGH' | Select-Object -First 1 | Format-List
