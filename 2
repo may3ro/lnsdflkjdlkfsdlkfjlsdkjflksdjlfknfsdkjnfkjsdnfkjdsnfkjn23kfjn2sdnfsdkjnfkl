@@ -10,28 +10,27 @@ param(
 )
 
 function Write-Info { param([string]$m) Write-Host "[INFO] $m" -ForegroundColor Cyan }
-function Write-Warn { param([string]$m) Write-Host "[WARN] $m" -ForegroundColor Yellow }
 function Write-Error { param([string]$m) Write-Host "[ERROR] $m" -ForegroundColor Red }
 
 $headers = @{ Authorization = "Basic $([Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Token")))"; Accept = 'application/json' }
 $ProgressPreference = 'SilentlyContinue'
 
-# Verify Connection
+# Verify
 $testUri = "$ServerUrl/api/system/status"
 try { $status = Invoke-RestMethod -Uri $testUri -Headers $headers -SkipCertificateCheck -ErrorAction Stop; Write-Info "Connected to $($status.version)" }
 catch { Write-Error "Connection failed: $($_.Exception.Message)"; return }
 
-# Rule Details (Recommendations + CWE)
+# Rule Details
 function Get-RuleDetails { param([string]$RuleKey)
     $uri = "$ServerUrl/api/rules/show?key=$RuleKey&actives_only=true"
     try {
         $r = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
         $desc = ($r.rule.htmlDesc -replace '<[^>]+>', '' -replace "`r`n","`n").Trim()
         return @{ Recommendation = ($desc -split "`n" | Where-Object {$_} | ForEach-Object Trim) -join ' '; Effort = $r.rule.remedialEffort ?? 'Unknown'; CWE = $r.rule.cwe ? ($r.rule.cwe -join ', ') : '' }
-    } catch { Write-Warn "Rule $RuleKey failed"; return @{ Recommendation = 'N/A'; Effort = 'Unknown'; CWE = '' } }
+    } catch { return @{ Recommendation = 'N/A'; Effort = 'Unknown'; CWE = '' } }
 }
 
-# Code Snippet (File-level Preview for Hotspots)
+# Code Snippet
 function Get-CodeSnippet { param([string]$ComponentKey, [int]$LineNumber)
     $uri = "$ServerUrl/api/sources/raw?key=$ComponentKey"
     try {
@@ -40,10 +39,8 @@ function Get-CodeSnippet { param([string]$ComponentKey, [int]$LineNumber)
         if ($lines.Count -eq 0) { return 'Empty file' }
 
         if (-not $LineNumber) {
-            # File-level: Preview first 10 + last 5 lines
-            $preview = $lines[0..[Math]::Min(9, $lines.Count-1)]
-            if ($lines.Count -gt 10) { $preview += '...' }
-            if ($lines.Count -gt 5) { $preview += $lines[-5..-1] }
+            $preview = $lines[0..9]
+            if ($lines.Count -gt 10) { $preview += '...' + $lines[-5..-1] }
             return ($preview | ForEach-Object { "Line: $_" }) -join "`n"
         }
 
@@ -51,10 +48,10 @@ function Get-CodeSnippet { param([string]$ComponentKey, [int]$LineNumber)
         $end = [Math]::Min($lines.Count, $LineNumber + $SnippetLinesAfter)
         $snippet = for ($i = $start-1; $i -lt $end; $i++) { "Line $($i+1): $($lines[$i])" }
         return $snippet -join "`n"
-    } catch { Write-Warn "Snippet failed: $ComponentKey"; return 'Source unavailable (check "See Source Code" perm)' }
+    } catch { return 'Source unavailable' }
 }
 
-# Fetch Security Issues (softwareQualities=SECURITY for 68)
+# Fetch Security Issues (softwareQualities=SECURITY)
 $allSecurity = @()
 $page = 1
 do {
@@ -63,13 +60,13 @@ do {
     Write-Info "Fetching Security page ${page} (softwareQualities=SECURITY)..."
     try {
         $resp = Invoke-RestMethod -Uri $uri -Headers $headers -SkipCertificateCheck -ErrorAction Stop
-        Write-Info "Raw: total=$($resp.paging.total), page=$($resp.paging.pageIndex)/$($resp.paging.pages)"
+        Write-Info "Raw: total=$($resp.paging.total)"
         $allSecurity += $resp.issues
         $page++
     } catch { Write-Error "API failed on page ${page}: $($_.Exception.Message)"; break }
 } while ($allSecurity.Count -lt $resp.paging.total -and $resp.issues.Count -gt 0)
 
-if ($allSecurity.Count -eq 0) { Write-Warn "0 Security issues. Verify project key and UI 'Software Quality' = Security."; return }
+if ($allSecurity.Count -eq 0) { Write-Error "0 security issues. Check project key."; return }
 
 # Export
 $export = foreach ($i in $allSecurity) {
@@ -84,14 +81,14 @@ $export = foreach ($i in $allSecurity) {
         'ABAP File'      = $file
         'Line'           = $i.line
         'Message'        = $i.message
-        'Recommendation' = ($rule.Recommendation.Substring(0, [Math]::Min(500, $rule.Recommendation.Length))) + '...'
+        'Recommendation' = $rule.Recommendation
         'Effort'         = $rule.Effort
         'CWE'            = $rule.CWE
-        'Code Snippet'   = ($snippet.Substring(0, [Math]::Min(2000, $snippet.Length))) + '...'
+        'Code Snippet'   = $snippet
     }
 }
 
 $export | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-Write-Info "Exported $($export.Count) Security issues (softwareQualities=SECURITY) to $OutputPath"
+Write-Info "Exported $($export.Count) Security issues to $OutputPath"
 Write-Info "Sample CRITICAL/HIGH:"
 $export | Where-Object Severity -in 'CRITICAL','HIGH' | Select-Object -First 1 | Format-List
