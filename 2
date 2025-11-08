@@ -13,26 +13,26 @@ function Write-Info { param([string]$m) Write-Host "[INFO] $m" -ForegroundColor 
 function Write-Warn { param([string]$m) Write-Host "[WARN] $m" -ForegroundColor Yellow }
 function Write-Error { param([string]$m) Write-Host "[ERROR] $m" -ForegroundColor Red }
 
-$headers = @{ Authorization = "Basic $([Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Token")))"; Accept = 'application/json' }
+# FIXED: Token must be in format "token:" for Basic Auth
+$pair = "$Token:"
+$basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+$headers = @{ Authorization = "Basic $basic"; Accept = 'application/json' }
 $ProgressPreference = 'SilentlyContinue'
 
 # Verify Connection
 $testUri = "$ServerUrl/api/system/status"
-try { $status = Invoke-RestMethod -Uri $testUri -Headers $headers -SkipCertificateCheck -ErrorAction Stop; Write-Info "Connected to $($status.version)" }
-catch { Write-Error "Connection failed: $($_.Exception.Message)"; return }
-
-# 1. List Projects to Verify Key
-Write-Info "Listing projects..."
-try {
-    $projects = Invoke-RestMethod -Uri "$ServerUrl/api/projects/search" -Headers $headers -SkipCertificateCheck -ErrorAction Stop
-    Write-Info "Available projects:"
-    $projects.components | ForEach-Object { Write-Host "Key: $($_.key) | Name: $($_.name)" }
-    if (-not ($projects.components.key -contains $ProjectKey)) {
-        Write-Warn "ProjectKey '$ProjectKey' not found. Use one from the list above."
-        return
-    }
+try { 
+    $status = Invoke-RestMethod -Uri $testUri -Headers $headers -SkipCertificateCheck -ErrorAction Stop 
+    Write-Info "Connected to $($status.version)" 
 }
-catch { Write-Error "Project list failed: $($_.Exception.Message)"; return }
+catch { 
+    Write-Error "Connection failed: $($_.Exception.Message)"
+    if ($_.Exception.Response.StatusCode -eq 401) {
+        Write-Warn "401 Unauthorized: Token is invalid or lacks 'Browse' permission."
+        Write-Warn "Fix: Go to SonarQube UI > My Account > Security > Generate new token with 'Browse' + 'See Source Code'."
+    }
+    return 
+}
 
 # Rule Details
 function Get-RuleDetails { param([string]$RuleKey)
@@ -77,10 +77,18 @@ do {
         Write-Info "Raw: total=$($resp.paging.total)"
         $allSecurity += $resp.issues
         $page++
-    } catch { Write-Error "API failed: $($_.Exception.Message)"; break }
+    } catch { 
+        if ($_.Exception.Response.StatusCode -eq 401) {
+            Write-Error "401 on issues API: Token lacks permission on project '$ProjectKey'."
+            Write-Warn "Fix: UI > Project Settings > Permissions > Add your user to 'Browse' + 'See Source Code'."
+        } else {
+            Write-Error "API failed: $($_.Exception.Message)"
+        }
+        break 
+    }
 } while ($allSecurity.Count -lt $resp.paging.total -and $resp.issues.Count -gt 0)
 
-if ($allSecurity.Count -eq 0) { Write-Warn "0 Security issues. Check project key."; return }
+if ($allSecurity.Count -eq 0) { Write-Warn "0 Security issues. Check token/project permissions."; return }
 
 # Export
 $export = foreach ($i in $allSecurity) {
